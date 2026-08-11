@@ -18,6 +18,17 @@ Architecture:
 # throw in patch if the versions differ.
 from .version import __version__, __version_tuple__  # isort:skip # noqa: F401
 
+# Early-register MindIE-SD custom ops (QBSA etc.) before CANN snapshots the
+# custom-op registry at the first regInfo lookup (vllm-ascend model
+# load/warmup). Without this, lazily-imported mindiesd ops (e.g.
+# eagle_quant_block_sparse_attention via RAINFUSION_ATTN) fail with EZ1014
+# "inferShape function does not exist" at first call. Mirrors PR #5891.
+try:
+    import mindiesd  # noqa: F401
+except Exception:  # pragma: no cover - mindiesd optional
+    pass
+
+
 try:
     from . import patch  # noqa: F401
 except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
