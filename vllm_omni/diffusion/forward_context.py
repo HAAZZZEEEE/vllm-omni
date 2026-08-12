@@ -34,6 +34,7 @@ class ForwardContext:
     split_text_embed_in_sp: bool = False
     denoise_step_idx: int | None = None
     denoise_timestep: float | None = None
+    total_denoise_steps: int | None = None
     # Per-request reference latent for img2img DiT models (e.g. Ming)
     ref_latent: torch.Tensor | None = None
     # whether to split the text embed in sequence parallel, if True, the text embed will be split in sequence parallel
@@ -262,8 +263,11 @@ class DenoiseProgressMixin:
         timestep=None,
         scheduler=None,
         normalized_timestep: float | None = None,
+        total_steps: int | None = None,
     ) -> None:
         set_forward_context_denoise_step_idx(step_idx)
+        if _forward_context is not None:
+            _forward_context.total_denoise_steps = total_steps
         if _forward_context is None:
             return
         if normalized_timestep is not None:

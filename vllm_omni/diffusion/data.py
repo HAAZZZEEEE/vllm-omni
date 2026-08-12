@@ -1682,6 +1682,7 @@ class BlockSparseSpec:
 
     sparsity: float = 0.8
     start_step: int = 0
+    end_step: int = 0
     skip_layers: str | list[int] | None = None
     skip_layer_indices: set[int] | None = field(default=None, repr=False)
 
@@ -1689,6 +1690,8 @@ class BlockSparseSpec:
         self.sparsity = _in_range(self.sparsity, "block_sparse.sparsity", 0.0, 1.0) or 0.0
         if self.start_step < 0:
             raise ValueError(f"block_sparse.start_step must be >= 0; got {self.start_step!r}.")
+        if self.end_step < 0:
+            raise ValueError(f"block_sparse.end_step must be >= 0; got {self.end_step!r}.")
         self.skip_layer_indices = parse_kv_cache_skip_selector(self.skip_layers)
 
 
@@ -1771,6 +1774,7 @@ class AttentionSpec:
             bs = self.block_sparse
             kw["sparsity"] = bs.sparsity
             kw["start_step"] = bs.start_step
+            kw["end_step"] = bs.end_step
             if bs.skip_layer_indices:
                 kw["skip_layers"] = sorted(bs.skip_layer_indices)
 

@@ -72,6 +72,7 @@ class RainFusionConfig:
 
     sparsity: float = 0.0
     start_step: int = 0
+    end_step: int = 0
     skip_layers: frozenset[int] = frozenset()
 
     @classmethod
@@ -80,6 +81,7 @@ class RainFusionConfig:
         return cls(
             sparsity=float(bk.get("sparsity", 0.0)),
             start_step=int(bk.get("start_step", 0)),
+            end_step=int(bk.get("end_step", 0)),
             skip_layers=frozenset(bk.get("skip_layers") or ()),
         )
 
@@ -232,7 +234,16 @@ class RainFusionAttentionImpl(AttentionImpl):
             return None
         if is_forward_context_available():
             step_idx = get_forward_context().denoise_step_idx
+            total_steps = get_forward_context().total_denoise_steps
             if step_idx is not None and step_idx < rf.start_step:
+                return None
+            # Tail fallback: keep the last ``end_step`` denoise steps dense.
+            if (
+                rf.end_step > 0
+                and step_idx is not None
+                and total_steps is not None
+                and step_idx >= total_steps - rf.end_step
+            ):
                 return None
         if self.qkv_layout is None:
             # The sparse path reads the sequence off dim 1, which the tensors alone
