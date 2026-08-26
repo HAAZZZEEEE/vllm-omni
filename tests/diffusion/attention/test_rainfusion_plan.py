@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Geometry contract RAINFUSION_ATTN enforces before handing a forward to rf_v2.
 
@@ -27,6 +27,8 @@ from vllm_omni.diffusion.attention.backends.rainfusion_attn import (
     RainFusionPlan,
 )
 from vllm_omni.platforms import current_omni_platform
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.npu]
 
 PREFIX_ROWS = 710  # 14 text rows + 696 audio rows
 ALIGNED_GRID = (62, 24, 40)  # 1280x768 -> 59520 video rows, 465 blocks
@@ -230,7 +232,9 @@ def test_irregular_video_tail_reproduces_dense_attention_with_updated_mindiesd()
     heads, head_dim = 4, 128
     q, k, v = (torch.randn(1, used, heads, head_dim, dtype=torch.bfloat16, device="npu") for _ in range(3))
 
-    impl = make_impl()
+    # Explicit bf16: the dense comparison exercises the plain sparse kernel,
+    # and older MindIE-SD releases do not accept precision= (gate would raise).
+    impl = make_impl(precision="bf16")
     impl.rainfusion = dataclasses.replace(impl.rainfusion, sparsity=0.0)
     plan = RainFusionPlan(prefix_len=prefix_len, used_len=used, latent_shape=list(grid))
     out = impl._forward_sparse_npu(q, k, v, plan)
@@ -244,6 +248,7 @@ def test_irregular_video_tail_reproduces_dense_attention_with_updated_mindiesd()
     error = (out.float() - reference.float()).abs().mean() / reference.float().abs().mean()
     assert error < 2e-3, f"mean relative error {error:.4%} against dense attention"
 
+
 # end_step tail fallback: the last ``end_step`` denoise steps must stay dense.
 
 
@@ -253,8 +258,9 @@ def test_end_step_tail_window_stays_dense():
     fc = mock.Mock()
     fc.denoise_step_idx = 47
     fc.total_denoise_steps = 50
-    with mock.patch.object(rainfusion_attn, "is_forward_context_available", return_value=True), mock.patch.object(
-        rainfusion_attn, "get_forward_context", return_value=fc
+    with (
+        mock.patch.object(rainfusion_attn, "is_forward_context_available", return_value=True),
+        mock.patch.object(rainfusion_attn, "get_forward_context", return_value=fc),
     ):
         assert impl._resolve_plan(make_metadata(ALIGNED_GRID)) is None
 
@@ -265,8 +271,9 @@ def test_end_step_before_tail_window_still_sparse():
     fc = mock.Mock()
     fc.denoise_step_idx = 46
     fc.total_denoise_steps = 50
-    with mock.patch.object(rainfusion_attn, "is_forward_context_available", return_value=True), mock.patch.object(
-        rainfusion_attn, "get_forward_context", return_value=fc
+    with (
+        mock.patch.object(rainfusion_attn, "is_forward_context_available", return_value=True),
+        mock.patch.object(rainfusion_attn, "get_forward_context", return_value=fc),
     ):
         assert impl._resolve_plan(make_metadata(ALIGNED_GRID)) is not None
 
@@ -277,8 +284,9 @@ def test_end_step_zero_never_triggers_tail_fallback():
     fc = mock.Mock()
     fc.denoise_step_idx = 49
     fc.total_denoise_steps = 50
-    with mock.patch.object(rainfusion_attn, "is_forward_context_available", return_value=True), mock.patch.object(
-        rainfusion_attn, "get_forward_context", return_value=fc
+    with (
+        mock.patch.object(rainfusion_attn, "is_forward_context_available", return_value=True),
+        mock.patch.object(rainfusion_attn, "get_forward_context", return_value=fc),
     ):
         assert impl._resolve_plan(make_metadata(ALIGNED_GRID)) is not None
 
@@ -289,7 +297,6 @@ def test_end_step_zero_never_triggers_tail_fallback():
 
 def _fake_mindiesd_module():
     """Install a minimal stand-in so the import inside _forward_sparse_npu succeeds."""
-    import sys
     import types
 
     fake = types.ModuleType("mindiesd")

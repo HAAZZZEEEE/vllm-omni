@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
+import functools
 import inspect
 import math
 from dataclasses import dataclass
@@ -57,6 +58,22 @@ _INCOMPATIBLE_MINDIESD = (
 )
 
 
+# Whether the installed mindiesd ``sparse_attention`` accepts ``precision=``.
+# Releases without it accept the kwarg through ``**kwargs`` but silently ignore
+# it, so a requested mix/fp8 mode would silently run the BF16 path. Cached
+# because forwards run per layer per denoise step.
+@functools.cache
+def _mindiesd_supports_precision() -> bool:
+    try:
+        from inspect import signature
+
+        from mindiesd import sparse_attention
+
+        return "precision" in signature(sparse_attention).parameters
+    except Exception:
+        return False
+
+
 def _try_extract_layer_index(prefix: str) -> int | None:
     if not prefix:
         return None
@@ -86,6 +103,7 @@ class RainFusionConfig:
     sparsity: float = 0.0
     start_step: int = 0
     end_step: int = 0
+    precision: str = "bf16"
     skip_layers: frozenset[int] = frozenset()
 
     @classmethod
@@ -95,6 +113,7 @@ class RainFusionConfig:
             sparsity=float(bk.get("sparsity", 0.0)),
             start_step=int(bk.get("start_step", 0)),
             end_step=int(bk.get("end_step", 0)),
+            precision=str(bk.get("precision", "bf16")),
             skip_layers=frozenset(bk.get("skip_layers") or ()),
         )
 
@@ -445,6 +464,13 @@ class RainFusionAttentionImpl(AttentionImpl):
             from mindiesd import sparse_attention
         except ImportError:
             raise ImportError(_MISSING_MINDIESD)
+        if self.rainfusion.precision != "bf16" and not _mindiesd_supports_precision():
+            raise RuntimeError(
+                f"block_sparse.precision={self.rainfusion.precision!r} requires MindIE-SD "
+                "with sparse_attention(precision=...) support; the installed mindiesd "
+                "silently ignores it and would run the BF16 path. Install a compatible "
+                "MindIE-SD release or use precision='bf16'."
+            )
 
         used = plan.used_len
         q, k, v = (tensor[:, :used] for tensor in (query, key, value))
@@ -457,6 +483,7 @@ class RainFusionAttentionImpl(AttentionImpl):
             "inner_precise": _INNER_PRECISE,
             "block_size": _BLOCK_SIZE,
             "sparsity": self.rainfusion.sparsity,
+            "precision": self.rainfusion.precision,
         }
         if plan.video_spans is not None:
             out = sparse_attention(
