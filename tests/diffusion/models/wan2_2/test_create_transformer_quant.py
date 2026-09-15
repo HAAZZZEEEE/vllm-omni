@@ -443,6 +443,56 @@ def _construct_quantized_pipeline(pipeline_kind, active, disk_quant_config, tmp_
     return pipeline
 
 
+@pytest.mark.parametrize("pipeline_kind", ["t2v", "i2v", "vace"])
+@pytest.mark.parametrize("method, flag", [("mxfp4", "is_checkpoint_mxfp4_serialized")])
+@pytest.mark.parametrize("offline", [False, True])
+def test_pipeline_constructor_routes_each_expert_quantization(
+    pipeline_kind, method, flag, offline, tmp_path, monkeypatch, mocker
+):
+    """Run the actual pipeline constructors, expert factories and quant-method dispatch."""
+    from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+
+    from vllm_omni.quantization import build_quant_config
+
+    active = build_quant_config(
+        {
+            "transformer": {
+                "method": method,
+                "w4a8_fallback_layers": ["blocks.10.attn1.to_qkv"],
+                "w4a8_fallback_steps": [0, 1],
+            },
+            "transformer_2": {
+                "method": method,
+                "w4a8_fallback_layers": ["blocks.11.attn1.to_qkv"],
+                "w4a8_fallback_steps": [],
+            },
+        }
+    )
+    disk_quant_config = None
+    if offline:
+        disk_quant_config = {
+            "quant_method": method,
+            flag: True,
+            "ignored_layers": ["blocks.12.ffn.net_2"],
+            "w4a8_fallback_layers": ["blocks.9.attn1.to_qkv"],
+            "w4a8_fallback_steps": [9],
+        }
+    pipeline = _construct_quantized_pipeline(pipeline_kind, active, disk_quant_config, tmp_path, monkeypatch)
+    for index, transformer in enumerate((pipeline.transformer, pipeline.transformer_2)):
+        received = transformer.received_quant_config
+        assert received.get_name() == method
+        assert getattr(received, flag) == offline
+        assert received.w4a8_fallback_steps == ([0, 1] if index == 0 else [])
+        selected = f"blocks.{10 + index}.attn1.to_qkv"
+        other = f"blocks.{11 - index}.attn1.to_qkv"
+        assert received.w4a8_fallback_layers == [selected]
+        assert received.get_quant_method(mocker.Mock(spec=LinearBase), selected).is_w4a8_fallback_layer
+        assert not received.get_quant_method(mocker.Mock(spec=LinearBase), other).is_w4a8_fallback_layer
+        if offline:
+            assert isinstance(
+                received.get_quant_method(mocker.Mock(spec=LinearBase), "blocks.12.ffn.net_2"), UnquantizedLinearMethod
+            )
+    assert pipeline.od_config.quantization_config is active
 
 
 @pytest.mark.parametrize("explicit_none", [False, True])
@@ -468,7 +518,7 @@ def test_pipeline_component_default_reaches_expert_factory(monkeypatch):
 
     FakeTransformer, captured = _make_fake_transformer()
     monkeypatch.setattr(wan22_module, "WanTransformer3DModel", FakeTransformer)
-    active = build_quant_config({"default": {"method": "mxfp4", "ignored_layers": ["blocks.10.attn1.to_qkv"]}})
+    active = build_quant_config({"default": {"method": "mxfp4", "w4a8_fallback_layers": ["blocks.10.attn1.to_qkv"]}})
     pipeline = _FakePipeline(OmniDiffusionConfig(model="", quantization_config=active))
     pipeline._create_transformer(_MIN_CFG, component="transformer_2")
     assert captured[-1]["quant_config"] is active.default_config
@@ -490,10 +540,10 @@ def test_pipeline_partial_expert_config_does_not_match_sibling(
     from vllm_omni.quantization import build_quant_config
 
     component_spec = {
-        configured_expert: {"method": "mxfp4", "ignored_layers": ["blocks.10.attn1.to_qkv"]},
+        configured_expert: {"method": "mxfp4", "w4a8_fallback_layers": ["blocks.10.attn1.to_qkv"]},
     }
     if with_default:
-        component_spec["default"] = {"method": "mxfp4", "ignored_layers": ["blocks.11.attn1.to_qkv"]}
+        component_spec["default"] = {"method": "mxfp4", "w4a8_fallback_layers": ["blocks.11.attn1.to_qkv"]}
     active = build_quant_config(component_spec)
     pipeline = _construct_quantized_pipeline(pipeline_kind, active, None, tmp_path, monkeypatch)
     sibling = "transformer_2" if configured_expert == "transformer" else "transformer"
@@ -502,7 +552,7 @@ def test_pipeline_partial_expert_config_does_not_match_sibling(
     assert selected is active.component_configs[configured_expert]
     assert other is active.default_config
     if with_default:
-        assert other.ignored_layers == ["blocks.11.attn1.to_qkv"]
+        assert other.w4a8_fallback_layers == ["blocks.11.attn1.to_qkv"]
     else:
         assert other is None
 
@@ -517,10 +567,18 @@ def test_enriched_auto_quantization_preserves_each_expert_policy(
         "quant_method": "mxfp4",
         "is_checkpoint_mxfp4_serialized": True,
         "ignored_layers": ["blocks.0.ffn.net_2"],
+        "w4a8_fallback_steps": [],
+        "w4a8_fallback_layers": [],
+        "mxfp4_scale_alg": 0,
+        "require_smooth_scale": False,
     }
     low = {
         **high,
         "ignored_layers": ["blocks.1.ffn.net_2"] if different_ignored_layers else high["ignored_layers"],
+        "w4a8_fallback_steps": [37],
+        "w4a8_fallback_layers": ["blocks.11.attn1.to_qkv"],
+        "mxfp4_scale_alg": 2,
+        "require_smooth_scale": True,
     }
     pipeline = _construct_quantized_pipeline(pipeline_kind, None, (high, low), tmp_path, monkeypatch)
     assert pipeline.od_config.quantization_config is not None  # enrich_config really detected the first expert.
@@ -528,6 +586,9 @@ def test_enriched_auto_quantization_preserves_each_expert_policy(
         config = transformer.received_quant_config
         for policy in (
             "ignored_layers",
-            "ignored_layers",
+            "w4a8_fallback_steps",
+            "w4a8_fallback_layers",
+            "mxfp4_scale_alg",
+            "require_smooth_scale",
         ):
             assert getattr(config, policy) == expected[policy], policy

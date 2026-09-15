@@ -18,7 +18,7 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.conv import Conv3dLayer
-from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
+from vllm.model_executor.layers.linear import ColumnParallelLinear, LinearBase, QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import (
@@ -986,8 +986,68 @@ class WanTransformer3DModel(nn.Module):
         # ROPE helper
         self._cached_rope_emb = None
         self._cached_rope_resolution = None
+        self._validate_w4a8_fallback_layers(quant_config)
 
+    def _validate_w4a8_fallback_layers(self, quant_config: QuantizationConfig | None) -> None:
+        """Reject checkpoint aliases/typos before loading weights or running inference."""
+        requested = tuple(getattr(quant_config, "w4a8_fallback_layers", []))
+        self._w4a8_fallback_layers = requested
+        self._local_w4a8_fallback_layers: tuple[str, ...] = ()
+        if not requested:
+            return
+        modules = dict(self.named_modules())
+        missing_pp_prefixes = [name for name, module in modules.items() if isinstance(module, PPMissingLayer)]
+        local_layers = [
+            name for name in requested if not any(name.startswith(prefix + ".") for prefix in missing_pp_prefixes)
+        ]
+        self._local_w4a8_fallback_layers = tuple(local_layers)
+        invalid = [name for name in local_layers if not isinstance(modules.get(name), LinearBase)]
+        if invalid:
+            raise ValueError(
+                "w4a8_fallback_layers requires exact runtime Linear paths relative to each Wan transformer; "
+                f"unknown/non-Linear paths: {invalid}. Use attn1.to_qkv for fused self-attention, "
+                "not checkpoint attn1.to_q/to_k/to_v names."
+            )
 
+    def _log_w4a8_fallback_load_summary(self, component_name: str) -> None:
+        """Log post-load transforms/cache readiness, not numerical acceptance."""
+        requested = self._w4a8_fallback_layers
+        if not requested:
+            return
+        modules = dict(self.named_modules())
+        local_layers = self._local_w4a8_fallback_layers
+        selected_layers = [
+            name for name in local_layers if getattr(modules[name].quant_method, "is_w4a8_fallback_layer", False)
+        ]
+        bf16_overrides = [name for name in local_layers if name not in selected_layers]
+        processed = [
+            name
+            for name in selected_layers
+            if getattr(modules[name], "_already_called_process_weights_after_loading", False)
+        ]
+        if not selected_layers:
+            processing_state = "not-required"
+        elif len(processed) == len(selected_layers):
+            processing_state = "ready"
+        else:
+            processing_state = "not-ready"
+
+        def qualified(names: Iterable[str]) -> list[str]:
+            return [f"{component_name}.{name}" for name in names]
+
+        logger.info(
+            "Wan W4A8 post-load summary: component=%s; selected=%d %s; BF16 overrides=%d %s; "
+            "weight/A8 processing state=%s (%d/%d selected layers processed); other PP ranks=%d",
+            component_name,
+            len(selected_layers),
+            qualified(selected_layers),
+            len(bf16_overrides),
+            qualified(bf16_overrides),
+            processing_state,
+            len(processed),
+            len(selected_layers),
+            len(requested) - len(local_layers),
+        )
 
     @property
     def dtype(self) -> torch.dtype:

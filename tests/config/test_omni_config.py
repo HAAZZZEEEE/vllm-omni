@@ -1717,11 +1717,11 @@ def test_diffusion_quantization_origin_survives_projection_and_transport(monkeyp
             "quantization_config": {
                 "quant_method": "mxfp4",
                 "is_checkpoint_mxfp4_serialized": True,
-                "ignored_layers": ["proj_out"],
+                "w4a8_fallback_steps": [37],
             }
         }
     )
-    requested = build_quant_config("mxfp4", ignored_layers=[]) if explicit else None
+    requested = build_quant_config("mxfp4", w4a8_fallback_steps=[]) if explicit else None
     cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(
         tf_model_config=checkpoint,
         quantization_config=requested,
@@ -1732,4 +1732,4 @@ def test_diffusion_quantization_origin_survives_projection_and_transport(monkeyp
     cfg.enrich_config()
     restored = ForkingPickler.loads(ForkingPickler.dumps(cfg))
     assert restored.quantization_config_is_auto_detected is not explicit
-    assert restored.quantization_config.ignored_layers == ([] if explicit else ["proj_out"])
+    assert restored.quantization_config.w4a8_fallback_steps == ([] if explicit else [37])
