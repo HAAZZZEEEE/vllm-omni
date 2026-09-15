@@ -652,3 +652,31 @@ def test_rocm_create_weights_row_parallel_tp2(_rocm_platform):
     assert layer.weight.shape == (_TP2_N, _TP2_K // _TP2)
     assert layer.input_size_per_partition == _TP2_K // _TP2
     assert layer.output_size_per_partition == _TP2_N
+
+
+@pytest.mark.parametrize("value", [True, False, None, "2", 2.0, 1, -1, 3])
+def test_mxfp4_scale_alg_rejects_invalid_values(value):
+    from vllm_omni.quantization import build_quant_config
+
+    with pytest.raises(ValueError, match="mxfp4_scale_alg"):
+        build_quant_config({"method": "mxfp4", "mxfp4_scale_alg": value})
+
+
+@pytest.mark.parametrize("runtime_alg", [0, 2])
+@pytest.mark.parametrize("serialized", [False, True])
+def test_runtime_algorithm_survives_offline_storage_rebuild(runtime_alg, serialized):
+    from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+    from vllm_omni.quantization.mxfp4_config import DiffusionMXFP4Config
+
+    active = DiffusionMXFP4Config(is_checkpoint_mxfp4_serialized=serialized, mxfp4_scale_alg=runtime_alg)
+    resolved = resolve_quant_config_from_disk(
+        active,
+        {
+            "quant_method": "mxfp4",
+            "is_checkpoint_mxfp4_serialized": True,
+            "mxfp4_scale_alg": 2,
+            "ignored_layers": ["proj_out"],
+        },
+    )
+    assert resolved.is_checkpoint_mxfp4_serialized
+    assert resolved.mxfp4_scale_alg == runtime_alg

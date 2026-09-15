@@ -105,10 +105,14 @@ class DiffusionMXFP4Config(QuantizationConfig):
         self,
         is_checkpoint_mxfp4_serialized: bool = False,
         ignored_layers: list[str] | None = None,
+        mxfp4_scale_alg: int = 0,
     ) -> None:
         super().__init__()
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.ignored_layers = ignored_layers or []
+        if type(mxfp4_scale_alg) is not int or mxfp4_scale_alg not in (0, 2):
+            raise ValueError("mxfp4_scale_alg must be 0 (OCP MX) or 2 (C7 with dst_type_max=7.25).")
+        self.mxfp4_scale_alg = mxfp4_scale_alg
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -139,6 +143,7 @@ class DiffusionMXFP4Config(QuantizationConfig):
         return cls(
             is_checkpoint_mxfp4_serialized=is_serialized,
             ignored_layers=ignored_layers,
+            mxfp4_scale_alg=config.get("mxfp4_scale_alg", 0),
         )
 
     def get_quant_method(
@@ -158,6 +163,8 @@ class DiffusionMXFP4Config(QuantizationConfig):
                     return NPUMxfp4LinearMethod(self)
                 return NPUMxfp4OnlineLinearMethod(self)
             if current_omni_platform.is_rocm():
+                if self.mxfp4_scale_alg != 0:
+                    raise NotImplementedError("MXFP4 C7 quantization is currently only supported on NPU (Ascend).")
                 gcn_arch = torch.cuda.get_device_properties(torch.accelerator.current_device_index()).gcnArchName
                 if "gfx950" not in gcn_arch:
                     raise NotImplementedError(f"MXFP4 on ROCm requires gfx950 (MI355X). Detected: {gcn_arch}")
@@ -174,6 +181,23 @@ class DiffusionMXFP4Config(QuantizationConfig):
 # ---------------------------------------------------------------------------
 # NPU MXFP4 single-scale offline method (pre-quantized checkpoint)
 # ---------------------------------------------------------------------------
+
+
+def _npu_quantize_mxfp4(x: torch.Tensor, scale_alg: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize weight or activation using the same explicit FP4 algorithm."""
+    import torch_npu
+
+    c7_kwargs = {"dst_type_max": 7.25} if scale_alg == 2 else {}
+    return torch_npu.npu_dynamic_mx_quant(
+        x,
+        dst_type=torch_npu.float4_e2m1fn_x2,
+        axis=-1,
+        block_size=32,
+        round_mode="rint",
+        scale_alg=scale_alg,
+        **c7_kwargs,
+    )
+
 
 
 class NPUMxfp4LinearMethod(MXFPLinearMethodBase):
@@ -263,10 +287,7 @@ class NPUMxfp4LinearMethod(MXFPLinearMethodBase):
     # --- NPU MXFP4 ops — shared with online path via inheritance ---
 
     def _quantize_activation(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        import torch_npu
-
-        # No dst_type: npu_dynamic_mx_quant defaults to float4_e2m1fn_x2.
-        return torch_npu.npu_dynamic_mx_quant(x)
+        return _npu_quantize_mxfp4(x, self.quant_config.mxfp4_scale_alg)
 
     def _quant_matmul(
         self,
@@ -318,8 +339,6 @@ class NPUMxfp4OnlineLinearMethod(_LazyWeightMixin, NPUMxfp4LinearMethod):
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
-        import torch_npu
-
         if layer.weight.device == torch.device("meta"):
             weight = ModelWeightParameter(
                 data=torch.empty_like(layer.weight, device=layer._load_device),
@@ -331,8 +350,8 @@ class NPUMxfp4OnlineLinearMethod(_LazyWeightMixin, NPUMxfp4LinearMethod):
             layer.register_parameter("weight", weight)
             initialize_single_dummy_weight(layer.weight)
 
-        # NPU: quantize BF16/FP16 (N, K) → FP4. No dst_type → float4_e2m1fn_x2.
-        weight_fp4, weight_scale_raw = torch_npu.npu_dynamic_mx_quant(layer.weight)
+        # Prepare once; offline checkpoints keep their existing weight algorithm.
+        weight_fp4, weight_scale_raw = _npu_quantize_mxfp4(layer.weight, self.quant_config.mxfp4_scale_alg)
 
         # Weight stays (N, K) — no pre-transpose for FP4 packed format.
         # Scale: (N, S) → (N, S/2, 2). Not pre-transposed; done inline in _quant_matmul.

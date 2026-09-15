@@ -494,6 +494,10 @@ def resolve_quant_config_from_disk(
             "Pass a matching --quantization flag or omit it for auto-detection."
         )
 
+    if hasattr(quant_config, "mxfp4_scale_alg"):
+        # Runtime activation policy is independent of how offline W4 was made.
+        qc_kwargs["mxfp4_scale_alg"] = quant_config.mxfp4_scale_alg
+
     if _disk_marks_serialized(qc_kwargs, quant_config):
         logger.info(
             "config.json marks checkpoint as serialized; switching to offline %s mode.",
