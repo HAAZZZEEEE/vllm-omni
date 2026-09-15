@@ -11,6 +11,11 @@ from vllm.config.load import LoadConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.forward_context import (
+    ForwardContext,
+    override_forward_context,
+    set_forward_context_denoise_step_idx,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.quantization.mxfp4_config import (
     DiffusionMXFP4Config,
@@ -162,3 +167,76 @@ def test_single_scale_smooth_uses_real_row_parallel_loader(rank):
     torch.testing.assert_close(layer.mul_scale, checkpoint_scale[rank * 512 : (rank + 1) * 512], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("scale_alg", [0, 2])
+def test_single_scale_smooth_precedes_quantization_and_preserves_output(
+    dtype, fallback, with_bias, scale_alg, monkeypatch
+):
+    config = DiffusionMXFP4Config(
+        is_checkpoint_mxfp4_serialized=True, w4a8_fallback_steps=[0], mxfp4_scale_alg=scale_alg
+    )
+    method = NPUMxfp4LinearMethod(config)
+    layer = _CheckpointLayer(method, dtype)
+    weights = {
+        "weight": torch.linspace(-0.5, 1.5, 1024, dtype=dtype).reshape(2, 512),
+        "weight_scale": torch.full((2, 16), 127, dtype=torch.uint8),
+        "mul_scale": torch.linspace(0.5, 3.0, 512),
+    }
+    _load_checkpoint(layer, config, weights, monkeypatch)
+    x = torch.linspace(-1.0, 2.0, 3072, dtype=dtype).reshape(2, 3, 512)
+    bias = torch.tensor([0.5, -1.0], dtype=dtype) if with_bias else None
+    quantized_inputs = []
+
+    # Only the two device operators are substituted. Exercise real apply(),
+    # step selection, Smooth multiplication, bias handling, and reshape logic.
+    npu = ModuleType("torch_npu")
+
+    def quantize(value, **kwargs):
+        quantized_inputs.append(value.clone())
+        expected = dict(
+            dst_type=torch.float8_e4m3fn if fallback else "fp4",
+            axis=-1,
+            block_size=32,
+            round_mode="rint",
+            scale_alg=0 if fallback else scale_alg,
+        )
+        if not fallback and scale_alg == 2:
+            expected["dst_type_max"] = 7.25
+        assert kwargs == expected
+        return value, torch.ones((6, 16), dtype=torch.uint8)
+
+    def matmul(x_q, weight, weight_scale, *, bias, output_dtype, **kwargs):
+        if fallback:
+            assert output_dtype == torch.bfloat16
+            if bias is not None:
+                assert bias.dtype == output_dtype
+                assert bias.shape == (1, 2)
+        result = x_q.float() @ weight.float()
+        if bias is not None:
+            result += bias.float()
+        return result.to(output_dtype)
+
+    npu.__dict__.update(
+        float8_e4m3fn=torch.float8_e4m3fn,
+        float8_e8m0fnu=torch.uint8,
+        float4_e2m1fn_x2="fp4",
+        npu_dynamic_mx_quant=quantize,
+        npu_quant_matmul=matmul,
+    )
+    monkeypatch.setitem(sys.modules, "torch_npu", npu)
+    with override_forward_context(ForwardContext()):
+        set_forward_context_denoise_step_idx(0 if fallback else 1)
+        result = method.apply(layer, x, bias)
+
+    expected_input = x.reshape(-1, 512) * weights["mul_scale"].to(dtype)
+    assert len(quantized_inputs) == 1
+    torch.testing.assert_close(quantized_inputs[0], expected_input, rtol=0, atol=0)
+    expected = expected_input.float() @ weights["weight"].float().T
+    if bias is not None:
+        expected += bias.float()
+    if fallback:
+        expected = expected.bfloat16()
+    torch.testing.assert_close(result, expected.to(dtype).reshape(2, 3, 2), rtol=0, atol=0)
+    assert result.dtype == dtype
