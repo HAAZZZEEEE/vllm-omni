@@ -680,3 +680,57 @@ def test_runtime_algorithm_survives_offline_storage_rebuild(runtime_alg, seriali
     )
     assert resolved.is_checkpoint_mxfp4_serialized
     assert resolved.mxfp4_scale_alg == runtime_alg
+
+
+def test_mxfp4_config_requires_offline_smooth():
+    from vllm_omni.quantization import build_quant_config
+    from vllm_omni.quantization.mxfp4_config import DiffusionMXFP4Config
+
+    values = {"is_checkpoint_mxfp4_serialized": True, "require_smooth_scale": True}
+    assert DiffusionMXFP4Config.from_config(values).require_smooth_scale
+    assert build_quant_config({"method": "mxfp4", **values}).require_smooth_scale
+    with pytest.raises(ValueError, match="offline"):
+        build_quant_config({"method": "mxfp4", "require_smooth_scale": True})
+    with pytest.raises(ValueError, match="boolean"):
+        DiffusionMXFP4Config.from_config({**values, "require_smooth_scale": "false"})
+
+
+@pytest.mark.parametrize("disk_requirement", [None, False, True])
+def test_mxfp4_expert_rebuild_cannot_weaken_explicit_smooth_requirement(disk_requirement):
+    from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+    from vllm_omni.quantization.mxfp4_config import DiffusionMXFP4Config
+
+    active = DiffusionMXFP4Config(is_checkpoint_mxfp4_serialized=True, require_smooth_scale=True)
+    disk = {
+        "quant_method": "mxfp4",
+        "is_checkpoint_mxfp4_serialized": True,
+        "ignored_layers": ["blocks.0.attn2.to_q"],
+    }
+    if disk_requirement is not None:
+        disk["require_smooth_scale"] = disk_requirement
+    resolved = resolve_quant_config_from_disk(active, disk)
+    assert resolved.require_smooth_scale
+    assert resolved.ignored_layers == disk["ignored_layers"]
+
+
+def test_quantization_disk_string_rejects_mismatched_active_method():
+    from vllm_omni.quantization import build_quant_config
+    from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+
+    active = build_quant_config("mxfp4")
+
+    with pytest.raises(ValueError, match="mxfp4_dualscale.*active quantization config is 'mxfp4'"):
+        resolve_quant_config_from_disk(active, "mxfp4_dualscale")
+
+
+def test_quantization_disk_string_accepts_equivalent_method_alias():
+    from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+
+    class ActiveAliasConfig:
+        @staticmethod
+        def get_name() -> str:
+            return "inc"
+
+    active = ActiveAliasConfig()
+
+    assert resolve_quant_config_from_disk(active, "auto-round") is active

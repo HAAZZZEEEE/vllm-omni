@@ -45,6 +45,7 @@ from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.norm import LayerNorm, RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization.mxfp4_config import NPUMxfp4LinearMethod
 
 logger = init_logger(__name__)
 
@@ -986,6 +987,8 @@ class WanTransformer3DModel(nn.Module):
         self._cached_rope_emb = None
         self._cached_rope_resolution = None
 
+
+
     @property
     def dtype(self) -> torch.dtype:
         """Return the dtype of the model parameters."""
@@ -1155,7 +1158,22 @@ class WanTransformer3DModel(nn.Module):
         }
 
         params_dict = dict(self.named_parameters())
+        single_scale_prefixes = {
+            name
+            for name, module in self.named_modules()
+            if isinstance(getattr(module, "quant_method", None), NPUMxfp4LinearMethod)
+        }
+
+        def reject_dualscale_tensor(name: str) -> None:
+            if name.endswith(".weight_dual_scale") and name.rsplit(".", 1)[0] in single_scale_prefixes:
+                raise ValueError(
+                    f"Single-scale mxfp4 cannot load DualScale tensor {name}; "
+                    "changing quant_method does not convert a checkpoint."
+                )
+
         loaded_params: set[str] = set()
+        loaded_qkv_shards: dict[str, set[str]] = {}
+        qkv_smooth_scales: dict[str, torch.Tensor] = {}
 
         for name, loaded_weight in weights:
             name = weight_name_remapping.get(name, name)
@@ -1166,15 +1184,32 @@ class WanTransformer3DModel(nn.Module):
             # Pre-fused to_qkv tensors (from offline MXFP8 merged checkpoint) fall
             # through to the else branch and are loaded directly.
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in original_name:
+                if f"{weight_name}." not in original_name:
                     continue
-                lookup_name = original_name.replace(weight_name, param_name)
+                lookup_name = original_name.replace(f"{weight_name}.", f"{param_name}.", 1)
+                reject_dualscale_tensor(lookup_name)
                 # Skip weights that belong to PP stages other than this one
                 if is_pp_missing_parameter(lookup_name, self) or lookup_name not in params_dict:
                     break
                 param = params_dict[lookup_name]
+                if lookup_name.endswith(".mul_scale"):
+                    previous_scale = qkv_smooth_scales.get(lookup_name)
+                    if previous_scale is not None and not torch.equal(previous_scale, loaded_weight):
+                        raise ValueError(f"Fused Q/K/V must share the same Smooth tensor: {lookup_name}")
+                    if previous_scale is None:
+                        qkv_smooth_scales[lookup_name] = loaded_weight.clone()
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(original_name)
+                if getattr(param, "output_dim", None) is None and not getattr(param, "needs_scalar_to_array", False):
+                    # Shared input-channel Smooth is a complete tensor even
+                    # when supplied under a single Q/K/V source name.
+                    loaded_params.add(lookup_name)
+                else:
+                    shards = loaded_qkv_shards.setdefault(lookup_name, set())
+                    shards.add(shard_id)
+                    if shards == {"q", "k", "v"}:
+                        loaded_params.add(lookup_name)
                 break
             else:
                 # diffusers: ffn.net.0.proj.weight -> our: ffn.net_0.proj.weight
@@ -1198,6 +1233,7 @@ class WanTransformer3DModel(nn.Module):
                 if is_pp_missing_parameter(lookup_name, self):
                     continue
 
+                reject_dualscale_tensor(lookup_name)
                 if lookup_name not in params_dict:
                     logger.warning(f"Skipping weight {original_name} -> {lookup_name}")
                     continue
@@ -1222,8 +1258,6 @@ class WanTransformer3DModel(nn.Module):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-
-            loaded_params.add(original_name)
-            loaded_params.add(lookup_name)
+                loaded_params.update((original_name, lookup_name))
 
         return loaded_params
