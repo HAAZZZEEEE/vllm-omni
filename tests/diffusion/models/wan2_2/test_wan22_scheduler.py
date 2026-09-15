@@ -23,7 +23,7 @@ def test_wan_unipc_matches_captured_native_full_schedule() -> None:
     golden = json.loads((Path(__file__).parent / "fixtures/native_unipc_shift12.json").read_text())
     scheduler = build_wan_scheduler("unipc", golden["runtime_shift"])
     for steps in (golden["steps"], 20, golden["steps"]):
-        scheduler.set_timesteps(steps, device="cpu")
+        scheduler.set_timesteps(steps, device="cpu", shift=golden["runtime_shift"])
         if steps == golden["steps"]:
             assert scheduler.timesteps.tolist() == golden["timesteps"]
             torch.testing.assert_close(scheduler.sigmas, torch.tensor(golden["sigmas"]), rtol=0, atol=0)
@@ -39,7 +39,8 @@ def test_wan_unipc_shifts_unmodified_training_endpoints(shift: float, steps: int
     expected_timesteps = (shifted * 1000).astype(np.int64)
     expected_sigmas: npt.NDArray[np.float32] = np.append(shifted, 0.0).astype(np.float32)
     scheduler = build_wan_scheduler("unipc", shift)
-    scheduler.set_timesteps(steps, device="cpu")
+    scheduler.set_timesteps(steps, device="cpu", shift=shift)
+    assert scheduler.config.shift == scheduler.config["shift"] == 1.0
     torch.testing.assert_close(scheduler.timesteps, torch.from_numpy(expected_timesteps), rtol=0, atol=0)
     torch.testing.assert_close(scheduler.sigmas, torch.from_numpy(expected_sigmas), rtol=0, atol=0)
 
