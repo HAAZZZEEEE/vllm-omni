@@ -27,6 +27,7 @@ def _patch_tp_state(monkeypatch):
 
 class _WanCheckpoint(torch.nn.Module):
     load_weights = WanTransformer3DModel.load_weights
+    _log_w4a8_fallback_load_summary = WanTransformer3DModel._log_w4a8_fallback_load_summary
 
     def __init__(self, config, *, num_blocks=1):
         super().__init__()
@@ -142,9 +143,95 @@ def test_wan_single_scale_rejects_relabelled_dualscale_checkpoint(fused, monkeyp
         _load(model, config, weights, monkeypatch)
 
 
+def test_wan_layer_policy_validates_runtime_qkv_and_bf16_override():
+    config = DiffusionMXFP4Config(w4a8_fallback_layers=["blocks.0.attn1.to_qkv"])
+    model = _WanCheckpoint(config)
+    # Uses the same validation called at the end of WanTransformer3DModel construction.
+    WanTransformer3DModel._validate_w4a8_fallback_layers(model, config)
+    for bad in ("blocks.0.attn1.to_q", "blocks.0.attn1", "blocks.99.attn1.to_qkv", "transformer.blocks.0.attn1.to_qkv"):
+        config.w4a8_fallback_layers = [bad]
+        with pytest.raises(ValueError, match="exact runtime Linear paths"):
+            WanTransformer3DModel._validate_w4a8_fallback_layers(model, config)
 
 
+def test_wan_layer_policy_defers_only_other_pp_stage_paths():
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    config = DiffusionMXFP4Config(w4a8_fallback_layers=["blocks.0.attn1.to_qkv", "blocks.1.attn1.to_qkv"])
+    model = _WanCheckpoint(config)
+    model.blocks.append(PPMissingLayer())
+    WanTransformer3DModel._validate_w4a8_fallback_layers(model, config)
+    config.w4a8_fallback_layers = ["blocks.1"]
+    with pytest.raises(ValueError, match="exact runtime Linear paths"):
+        WanTransformer3DModel._validate_w4a8_fallback_layers(model, config)
 
 
+@pytest.mark.parametrize("is_checkpoint_serialized", [False, True], ids=["online", "offline"])
+def test_loader_logs_wan_expert_summaries_after_weight_processing(is_checkpoint_serialized, mocker):
+    selected = "blocks.0.attn1.to_qkv"
+    bf16 = "blocks.1.attn1.to_qkv"
+    transformer_config = DiffusionMXFP4Config(
+        is_checkpoint_mxfp4_serialized=is_checkpoint_serialized,
+        w4a8_fallback_layers=[selected],
+    )
+    transformer_2_config = DiffusionMXFP4Config(
+        is_checkpoint_mxfp4_serialized=is_checkpoint_serialized,
+        ignored_layers=[bf16],
+        w4a8_fallback_layers=[selected, bf16],
+    )
+    pipeline = torch.nn.Module()
+    pipeline.transformer = _WanCheckpoint(transformer_config)
+    pipeline.transformer_2 = _WanCheckpoint(transformer_2_config, num_blocks=2)
+    WanTransformer3DModel._validate_w4a8_fallback_layers(pipeline.transformer, transformer_config)
+    WanTransformer3DModel._validate_w4a8_fallback_layers(pipeline.transformer_2, transformer_2_config)
+
+    loader = DiffusersPipelineLoader(
+        LoadConfig(),
+        OmniDiffusionConfig(model="", dtype=torch.bfloat16, quantization_config=transformer_config),
+    )
+    events = []
+    summaries = []
+
+    def process_weights(model, _target_device):
+        events.append("process")
+        for module in model.modules():
+            method = getattr(module, "quant_method", None)
+            if getattr(method, "is_w4a8_fallback_layer", False):
+                module._already_called_process_weights_after_loading = True
+
+    def capture_summary(message, *args):
+        rendered = message % args
+        summaries.append(rendered)
+        events.append(f"summary:{args[0]}")
+
+    loader._init_from_load_format = lambda *_args, **_kwargs: pipeline  # type: ignore[method-assign]
+    loader.load_weights = lambda _model: events.append("load")  # type: ignore[method-assign]
+    loader._process_weights_after_loading = process_weights  # type: ignore[method-assign]
+    loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
+    mocker.patch(
+        "vllm_omni.diffusion.models.wan2_2.wan2_2_transformer.logger.info",
+        side_effect=capture_summary,
+    )
+
+    assert loader.load_model(load_device="cpu") is pipeline
+    assert events == ["load", "process", "summary:transformer", "summary:transformer_2"]
+    assert "component=transformer; selected=1 ['transformer.blocks.0.attn1.to_qkv']" in summaries[0]
+    assert "BF16 overrides=0 []" in summaries[0]
+    assert "weight/A8 processing state=ready (1/1 selected layers processed)" in summaries[0]
+    assert "component=transformer_2; selected=1 ['transformer_2.blocks.0.attn1.to_qkv']" in summaries[1]
+    assert "BF16 overrides=1 ['transformer_2.blocks.1.attn1.to_qkv']" in summaries[1]
+    assert "weight/A8 processing state=ready (1/1 selected layers processed)" in summaries[1]
 
 
+def test_wan_load_summary_does_not_claim_unprocessed_layer_is_ready(mocker):
+    selected = "blocks.0.attn1.to_qkv"
+    config = DiffusionMXFP4Config(w4a8_fallback_layers=[selected])
+    model = _WanCheckpoint(config)
+    WanTransformer3DModel._validate_w4a8_fallback_layers(model, config)
+    logger_info = mocker.patch("vllm_omni.diffusion.models.wan2_2.wan2_2_transformer.logger.info")
+
+    WanTransformer3DModel._log_w4a8_fallback_load_summary(model, "transformer")
+
+    message, *args = logger_info.call_args.args
+    rendered = message % tuple(args)
+    assert "weight/A8 processing state=not-ready (0/1 selected layers processed)" in rendered
