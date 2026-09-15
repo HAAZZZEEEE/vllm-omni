@@ -166,7 +166,7 @@ class DiffusionMXFP4Config(QuantizationConfig):
             raise ValueError("require_smooth_scale requires an offline MXFP4 checkpoint")
         self.require_smooth_scale = require_smooth_scale
         if type(mxfp4_scale_alg) is not int or mxfp4_scale_alg not in (0, 2):
-            raise ValueError("mxfp4_scale_alg must be 0 (OCP MX) or 2 (C7 with dst_type_max=7.25).")
+            raise ValueError("mxfp4_scale_alg must be 0 (OCP MX) or 2 (UOS with dst_type_max=7.25).")
         self.mxfp4_scale_alg = mxfp4_scale_alg
 
     @classmethod
@@ -222,7 +222,7 @@ class DiffusionMXFP4Config(QuantizationConfig):
                 return NPUMxfp4OnlineLinearMethod(self, prefix=prefix)
             if current_omni_platform.is_rocm():
                 if self.mxfp4_scale_alg != 0:
-                    raise NotImplementedError("MXFP4 C7 quantization is currently only supported on NPU (Ascend).")
+                    raise NotImplementedError("MXFP4 UOS quantization is currently only supported on NPU (Ascend).")
                 if self.w4a8_fallback_steps or self.w4a8_fallback_layers:
                     raise NotImplementedError(
                         "MXFP4 W4A8 step/layer fallback is currently only supported on NPU (Ascend)."
@@ -249,7 +249,9 @@ def _npu_quantize_mxfp4(x: torch.Tensor, scale_alg: int) -> tuple[torch.Tensor, 
     """Quantize weight or activation using the same explicit FP4 algorithm."""
     import torch_npu
 
-    c7_kwargs = {"dst_type_max": 7.25} if scale_alg == 2 else {}
+    # Universal Optimal Scaling (Qmax=7.25), MXAttention Section 4.1:
+    # https://arxiv.org/abs/2607.24377
+    scale_kwargs = {"dst_type_max": 7.25} if scale_alg == 2 else {}
     return torch_npu.npu_dynamic_mx_quant(
         x,
         dst_type=torch_npu.float4_e2m1fn_x2,
@@ -257,7 +259,7 @@ def _npu_quantize_mxfp4(x: torch.Tensor, scale_alg: int) -> tuple[torch.Tensor, 
         block_size=32,
         round_mode="rint",
         scale_alg=scale_alg,
-        **c7_kwargs,
+        **scale_kwargs,
     )
 
 

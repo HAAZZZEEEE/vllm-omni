@@ -114,7 +114,7 @@ def test_single_scale_step_fallback_matches_independent_dense_reference(dtype):
     # Synthetic serialized single-scale values and E8M0 exponent bytes.
     # Powers of two make both activation precisions exact: this independent
     # CPU dense oracle needs no production packing, dequantization or apply.
-    # Real C7 export validation remains a separate checkpoint/E2E gate.
+    # Real UOS-quantized checkpoint validation remains a separate checkpoint/E2E gate.
     values = torch.tensor([1.0, -1.0, 2.0, -2.0]).repeat(32).unsqueeze(1).expand(128, 512)
     weight = torch.cat((values, values), dim=1)
     fine = torch.cat((torch.full((128, 16), 127), torch.full((128, 16), 128)), dim=1).to(torch.uint8)
