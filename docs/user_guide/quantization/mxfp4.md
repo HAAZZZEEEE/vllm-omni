@@ -6,6 +6,9 @@ W4A4 MXFP4 (Microscaling FP4) quantizes both weights and activations to FP4
 (`float4_e2m1fn_x2`, packed 2 values per byte) using the OCP MX format: groups
 of 32 K-dimension elements share a single `float8_e8m0fnu` exponent scale.
 
+On Ascend, single-scale MXFP4 also supports Universal Optimal Scaling
+(UOS, `Qmax=7.25`), described in the single-scale online section below.
+
 vLLM-Omni provides two quantization methods with different scale structures:
 
 | Method | Scale structure | Mode | Use case |
@@ -68,7 +71,7 @@ layout described below; changing a DualScale checkpoint's method name to
 `mxfp4` does not convert its weights. Prepare single-scale checkpoints with
 external tooling. Real exported checkpoint compatibility and model quality
 require validation of that checkpoint; the synthetic tests do not establish
-C7 export or video acceptance.
+UOS export or video acceptance.
 
 !!! note "Per-layer BF16 fallback in offline cascade models"
     The A14B offline checkpoint uses `quant_method: mxfp4_dualscale`. Most
@@ -177,7 +180,7 @@ compatibility with the target A5 runtime. An FP16 caller receives that result
 converted back to FP16; its output shape and dtype are preserved.
 
 The single-scale fallback validation target is eager Wan2.2 T2V A14B on A5.
-Quality scores, optimal fallback lists, real C7 exports and additional
+Quality scores, optimal fallback lists, real UOS exports and additional
 compile/offload combinations require separate evaluation. Existing W4A4-only
 DualScale still needs complete 512-channel input groups; use TP=1 with
 sequence/CFG parallelism for its initial multi-card run.
@@ -228,7 +231,7 @@ including when the other source omits the flag or sets it to `false`.
 Prepare the canonical numeric FP4 checkpoint before inference using external
 tooling. Runtime loading does not parse producer-specific export formats.
 Retain the producer recipe to identify the weight-generation algorithm and
-Smooth calibration; tensor storage alone does not establish C7 provenance.
+Smooth calibration; tensor storage alone does not establish UOS provenance.
 
 ### `mxfp4` — Single-Scale Online Mode
 
@@ -238,21 +241,28 @@ Online mode quantizes BF16/FP16 weights once at loading. On NPU,
 | Setting | W4 / A4 algorithm | NPU parameters |
 | --- | --- | --- |
 | `0` (default) | OCP MX | `scale_alg=0` |
-| `2` | C7 | `scale_alg=2, dst_type_max=7.25` |
+| `2` | UOS (`Qmax=7.25`) | `scale_alg=2, dst_type_max=7.25` |
+
+Universal Optimal Scaling (UOS, `Qmax=7.25`) is derived in
+[MXAttention: Data-Free Optimal Scaling and Pre-Normalization Quantization for MXFP4 Attention](https://arxiv.org/abs/2607.24377),
+Section 4.1. The value `7.25` is the boundary used to select the shared
+power-of-two scale; the maximum finite E2M1 value remains `6`.
+This option applies UOS to Linear quantization. It does not implement the
+paper's full MXAttention pipeline or Pre-Normalization Quantization (PNQ).
 
 Both use FP4 E2M1 with E8M0 scales, `axis=-1`, `block_size=32`,
 `round_mode="rint"`. W4A8 always quantizes the activation to
 `float8_e4m3fn` with `scale_alg=0` and the same grouping/rounding, without
-C7 parameters. A4 and A8 share the prepared W4 and scale. C7 is currently
+UOS parameters. A4 and A8 share the prepared W4 and scale. UOS is currently
 NPU-only; ROCm retains its existing AITER online algorithm.
 
-An explicit C7 online configuration is
+An explicit UOS online configuration is
 `{"method": "mxfp4", "mxfp4_scale_alg": 2}`. For offline checkpoints the
 setting affects **only A4 activations**. Existing weights are never requantized:
-a C7 checkpoint can run C7 W4 + C7 A4 or C7 W4 + OCP A4, and both fall back to
-C7 W4 + OCP A8. Record the weight-generation algorithm separately from the
+a UOS checkpoint can run UOS W4 + UOS A4 or UOS W4 + OCP A4, and both fall back to
+UOS W4 + OCP A8. Record the weight-generation algorithm separately from the
 runtime activation setting. Smooth remains active with either setting. The
-formal C7 precision recipe explicitly selects `2`; FA is unchanged.
+formal UOS precision recipe explicitly selects `2`; FA is unchanged.
 
 A single block scale
 (`float8_e8m0fnu`, one per 32 K elements) is computed on the fly; no
@@ -450,7 +460,7 @@ omni = Omni(model="/path/to/Wan2.2-T2V-A14B-MXFP4-DualScale")
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |
 | `method` | str | — | `"mxfp4"` |
-| `mxfp4_scale_alg` | int | `0` | `0`: OCP MX; `2`: C7 A4 quantization with `dst_type_max=7.25`; A8 remains OCP MX |
+| `mxfp4_scale_alg` | int | `0` | `0`: OCP MX; `2`: UOS A4 quantization with `dst_type_max=7.25`; A8 remains OCP MX |
 | `require_smooth_scale` | bool | `false` | Require calibrated Smooth tensors for offline single-scale weights |
 | `ignored_layers` | list[str] | `[]` | Layer prefixes to keep in BF16 |
 | `w4a8_fallback_layers` | list[str] | `[]` | Exact runtime Linear paths that always use A8; NPU only |
