@@ -19,7 +19,8 @@ bash smoke.sh /absolute/path/env.sh    # 用上一步的 model/ 生成一个视�
 ```
 
 `run.sh` 与 `smoke.sh` 可以分别在不同节点执行：导出需要 NPU 与 msModelSlim 环境，
-视频需要 Omni 推理镜像。两边各写一份 env.sh 即可。
+视频需要 Omni 推理镜像。两边各写一份 env.sh 即可。**但更推荐在同一台机器上跑完**，
+见下文「本次实测」——跨机需要搬 66G 的 `model/`，而同机只需要带上源码树和覆盖补丁。
 
 失败即退出；`OUTPUT_ROOT/native` 或 `OUTPUT_ROOT/model` 已存在时直接拒绝覆盖。
 
@@ -91,7 +92,27 @@ $OUTPUT_ROOT/
 `smoke.sh` 退出码 0，且 `logs/video-validation.json` 为 `"status": "passed"`，
 `decoded_frames` 等于设定帧数。质量与性能评估不在本工具范围。
 
-## 依赖与环境
+## 本次实测（2026-09-16）
+
+在 184（k8s-node-01）用 **同一台机器**跑完 导出→转换→校验→出片，全程未搬动 checkpoint。
+
+| 项 | 结果 |
+|---|---|
+| 导出 | msModelSlim 双专家，NPU2，单级 W4A4_MXFP4；`native/` 22G，每专家 350 量化层 / 350 Smooth 层 |
+| 导出描述哈希 | `eb6a64dbc0ef11a7191fe55581290166a29f6cbe2eeb70b8b835baa5a48e8f31`（与历史 C7 导出一致） |
+| 结构校验 | `EXPORT_STRUCTURE_VALIDATED` |
+| 转换 | 66G；两专家 `quant_method=mxfp4`、`is_checkpoint_mxfp4_serialized=true`、`require_smooth_scale=true`、`mxfp4_scale_alg=2`、`ignored_layers=247` |
+| 对账 | `CONVERTED_CHECKPOINT_RECONCILED`；两专家各 350/350 层全量逐 tensor 一致 |
+| 视频 | 退出码 0，33 帧全解码，832×480、16fps、h264，sha256 `ee46b729a498f85b16253b062da32b3e01d005c846391f546500437f79a4cb6e` |
+| 移出测试 | 78 passed，退出码 0 |
+
+视频哈希与 Task7 已验证产物**逐字节相同**，说明重新导出的权重与已验证 checkpoint 数值等价。
+
+> **建议在同一台机器上跑完两条入口。** `model/` 约 66G，把它搬到另一台机器只为出片并不划算；
+> 换机器真正需要携带的只有已验证的 `OMNI_SOURCE` 源码树（约 75MB）和
+> `ADALAYERNORM_PATCH`（约 5KB）。本次视频就是在转换节点本机出片的。
+
+
 
 导出镜像与关键版本（实测）：
 
