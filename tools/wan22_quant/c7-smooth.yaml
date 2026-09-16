@@ -1,0 +1,53 @@
+apiversion: multimodal_sd_modelslim_v1
+metadata:
+  config_id: wan22_linear_c7_725_smooth_stage4
+  score: 0
+  verified_tags: {}
+  label:
+    w_bit: 4
+    a_bit: 4
+    is_sparse: false
+    fa_quant: false
+spec:
+  process:
+    - type: iter_smooth
+      alpha: 0.25
+      include: ["*"]
+      exclude: ["*blocks.0.*", "*blocks.1.*", "*blocks.2.*", "*blocks.3.*", "*blocks.4.*"]
+    - type: linear_quant
+      qconfig:
+        act:
+          scope: per_block
+          dtype: mxfp4
+          symmetric: true
+          method: minmax
+        weight:
+          scope: per_block
+          dtype: mxfp4
+          symmetric: true
+          method: ceil_x
+          ext:
+            ceil_x_value: 7.25
+            enable_search: false
+      include: ["*"]
+      exclude: ["*blocks.0.*", "*blocks.1.*", "*blocks.2.*", "*blocks.3.*", "*blocks.4.*"]
+  # 校准输入在容器内固定挂载为 /dataset（宿主目录由 env.sh 的 CALIB_DATASET_DIR 指定）。
+  dataset: /dataset/index.jsonl
+  save:
+    - type: mindie_format_saver
+      part_file_size: 0
+  multimodal_sd_config:
+    dump_config:
+      enable_dump: true
+      capture_mode: args
+      dump_data_dir: ""
+    inference_config:
+      task: t2v-A14B
+      size: "1280*720"
+      frame_num: 81
+      sample_steps: 40
+      sample_shift: 12.0
+      sample_solver: unipc
+      base_seed: 0
+      offload_model: true
+      convert_model_dtype: true
