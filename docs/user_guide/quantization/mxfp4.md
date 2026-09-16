@@ -7,21 +7,21 @@ W4A4 MXFP4 (Microscaling FP4) quantizes both weights and activations to FP4
 of 32 K-dimension elements share a single `float8_e8m0fnu` exponent scale.
 
 On Ascend, single-scale MXFP4 also supports Universal Optimal Scaling
-(UOS, `Qmax=7.25`), described in the single-scale online section below.
+(UOS, `Qmax=7.25`), described in the single-scale scaling section below.
 
 vLLM-Omni provides two quantization methods with different scale structures:
 
 | Method | Scale structure | Mode | Use case |
 | -------- | ---------------- | ------ | ---------- |
 | `mxfp4` | Single-scale (per-32 fine only) | Online + pre-quantized single-scale weights | Online baseline, or an existing single-scale checkpoint in the layout below |
-| `mxfp4_dualscale` | Dual-scale (fine per-32 + coarse per-512 + per-channel `mul_scale`) | Online + Offline | Production; better accuracy; offline recommended |
+| `mxfp4_dualscale` | Dual-scale (fine per-32 + coarse per-512 + per-channel `mul_scale`) | Online + Offline | W4A4 with dual-level scales; offline mode loads calibrated Smooth tensors |
 
 !!! tip "Existing W4A4-only DualScale deployments"
     For W4A4-only deployments, the existing `mxfp4_dualscale` offline mode uses a
     pre-quantized checkpoint produced by msModelSlim. Offline checkpoints load
-    calibrated `mul_scale` tensors from disk, providing measurably better accuracy
-    than any online method. The one-time preprocessing cost amortises across all
-    subsequent inference runs.
+    calibrated `mul_scale` tensors from disk. Quality depends on the model,
+    calibration recipe and BF16 fallback policy; evaluate the checkpoint against
+    your quality target before deployment.
 
     W4A8 layer/step fallback requires single-scale `mxfp4`, online or offline.
     DualScale supports W4A4 and BF16 routing only.
@@ -37,16 +37,19 @@ vLLM-Omni provides two quantization methods with different scale structures:
 
 ## Hardware Support
 
-| Device | Support |
-| -------- | --------- |
-| NVIDIA Blackwell GPU (SM 100+) | ⭕ |
-| NVIDIA Ada/Hopper GPU (SM 89+) | ⭕ |
-| NVIDIA Ampere GPU (SM 80+) | ⭕ |
-| AMD ROCm (gfx950 / MI355X) | ✅ |
-| Intel XPU | ⭕ |
-| Ascend NPU (Atlas 950 A5) | ✅ |
+The following matrix describes these vLLM-Omni implementations, rather than
+hardware support for the MXFP4 format in general.
 
-Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this guide.
+| Device | Single-scale online OCP | Single-scale offline | UOS / W4A8 fallback | DualScale |
+| -------- | -------- | -------- | -------- | -------- |
+| Ascend NPU (Atlas 950 A5) | ✅ | ✅ | ✅ | ✅ |
+| AMD ROCm (gfx950 / MI355X) | ✅ | ❌ | ❌ | ❌ |
+| Other AMD architectures | ❌ | ❌ | ❌ | ❌ |
+| NVIDIA GPU | ❌ | ❌ | ❌ | ❌ |
+| Intel XPU | ❌ | ❌ | ❌ | ❌ |
+
+Legend: `✅` supported by the implementation, `❌` unsupported.
+ROCm uses the existing AITER online path and requires `mxfp4_scale_alg=0`.
 
 ## Model Type Support
 
@@ -56,14 +59,13 @@ Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this guide.
 | ------- | -------- | --------- | ------- |
 | Wan2.2-T2V-A14B | `mxfp4` / `mxfp4_dualscale` | `mxfp4` / `mxfp4_dualscale` | Cascade experts resolve checkpoint metadata independently; explicit global runtime policy applies to both |
 | Wan2.2-I2V-A14B | `mxfp4` / `mxfp4_dualscale` | `mxfp4` / `mxfp4_dualscale` | Per-expert configuration uses the same interface as T2V; validate I2V checkpoints separately |
-| Wan2.2-TI2V-5B | ❌ | ❌ | Parameter count too small; W4A4 causes unacceptable accuracy loss |
+| Wan2.2-TI2V-5B | Requires validation | Requires validation | This guide does not establish checkpoint compatibility or generation quality for TI2V-5B |
 
-The choice between `mxfp4` and `mxfp4_dualscale` in **online mode** is about
-quantization quality, not model compatibility — both work on cascade (A14B) and
-single-transformer models alike, the same as `mxfp8` online:
+Both methods can be integrated with single-transformer and cascade models.
+This alone does not establish support or quality for every model variant:
 
-- `mxfp4`: single-scale, lower overhead, simpler compute; online and pre-quantized weights
-- `mxfp4_dualscale`: dual-scale + optional BF16 fallback, better accuracy, online **and** offline
+- `mxfp4`: single-scale; online and pre-quantized weights, with optional W4A8 fallback on NPU
+- `mxfp4_dualscale`: dual-scale; online and offline, with BF16 fallback
 
 The existing `merge_mxfp4_dualscale_checkpoint.py` produces **offline
 `mxfp4_dualscale`** checkpoints. Single-scale weights must satisfy the separate
@@ -74,18 +76,12 @@ require validation of that checkpoint; the synthetic tests do not establish
 UOS export or video acceptance.
 
 !!! note "Per-layer BF16 fallback in offline cascade models"
-    The A14B offline checkpoint uses `quant_method: mxfp4_dualscale`. Most
+    An A14B offline DualScale checkpoint uses `quant_method: mxfp4_dualscale`. Most
     linear layers are stored as W4A4 MXFP4 DualScale; precision-sensitive layers
     retain their original BF16 weights and are listed in `ignored_layers` inside
     each transformer's `config.json`. The two transformers may have different
     `ignored_layers` sets — the pipeline reads each transformer's own `config.json`
-    and rebuilds the config locally when they differ, so routing is always
-    per-transformer-accurate.
-
-!!! warning "TI2V-5B not supported"
-    Wan2.2-TI2V-5B is excluded from W4A4 quantization. Its smaller parameter
-    count makes it significantly more sensitive to 4-bit quantization noise,
-    resulting in unacceptable accuracy loss. Use [MXFP8](mxfp8.md) for TI2V-5B.
+    and resolves the storage format and BF16 layer policy independently.
 
 ## Configuration
 
@@ -233,12 +229,20 @@ tooling. Runtime loading does not parse producer-specific export formats.
 Retain the producer recipe to identify the weight-generation algorithm and
 Smooth calibration; tensor storage alone does not establish UOS provenance.
 
-### `mxfp4` — Single-Scale Online Mode
+### `mxfp4` — Single-Scale Block Scaling (OCP / UOS)
 
-Online mode quantizes BF16/FP16 weights once at loading. On NPU,
-`mxfp4_scale_alg` selects both online W4 preparation and runtime A4:
+`mxfp4_scale_alg` selects the MXFP4 block-scaling method on NPU.
+UOS is a scaling rule, not a separate activation dtype or an activation-only
+algorithm. Both choices use FP4 E2M1 values with shared E8M0 scales.
 
-| Setting | W4 / A4 algorithm | NPU parameters |
+| Mode | Weight preparation | A4 activation quantization | W4A8 fallback |
+| --- | --- | --- | --- |
+| Online | Selected scaling method, once at loading | Selected scaling method | Same W4; OCP MXFP8 A8 |
+| Offline | Load existing W4 and scales unchanged | Selected scaling method | Same W4; OCP MXFP8 A8 |
+
+The available settings are:
+
+| Setting | MXFP4 scaling method | NPU parameters |
 | --- | --- | --- |
 | `0` (default) | OCP MX | `scale_alg=0` |
 | `2` | UOS (`Qmax=7.25`) | `scale_alg=2, dst_type_max=7.25` |
@@ -262,13 +266,15 @@ setting affects **only A4 activations**. Existing weights are never requantized:
 a UOS checkpoint can run UOS W4 + UOS A4 or UOS W4 + OCP A4, and both fall back to
 UOS W4 + OCP A8. Record the weight-generation algorithm separately from the
 runtime activation setting. Smooth remains active with either setting. The
-formal UOS precision recipe explicitly selects `2`; FA is unchanged.
+UOS configuration explicitly selects `2`; attention computation is unchanged.
 
-A single block scale
-(`float8_e8m0fnu`, one per 32 K elements) is computed on the fly; no
-calibration `mul_scale` is available. Applies equally to single-transformer
-and cascade (A14B) models — both transformers in a cascade receive the same
-quantization config automatically.
+### `mxfp4` — Single-Scale Online Mode
+
+Online mode quantizes BF16/FP16 weights once at loading and computes activation
+scales during forward. Each block of 32 K elements shares one E8M0 scale;
+no calibrated `mul_scale` is available. An explicit global quantization config
+applies to both cascade experts. Per-component configs can select different
+policies; checkpoint auto-detection resolves each expert independently.
 
 ```python
 from vllm_omni import Omni
@@ -283,7 +289,7 @@ outputs = omni.generate(
 
 ```bash
 # Single-transformer or cascade model — same command
-python text_to_video.py --model <your-model> --quantization mxfp4
+python examples/offline_inference/text_to_video/text_to_video.py --model <your-model> --quantization mxfp4
 
 # Online serving
 vllm serve <your-model> --omni --quantization mxfp4
@@ -293,19 +299,19 @@ vllm serve <your-model> --omni --quantization mxfp4
 
 Online DualScale mode computes both fine and coarse scales on the fly from BF16
 weights using `npu_dynamic_dual_level_mx_quant`. Applies equally to
-single-transformer and cascade (A14B) models. Compared to `mxfp4` online,
-DualScale provides better quantization accuracy at higher compute cost.
+single-transformer and cascade (A14B) models with compatible Linear layers.
+Compare quality and performance using the intended model and workload.
 
 The default configuration keeps the leading 5 transformer blocks in BF16
-(`num_bf16_fallback_layers=5`). Accuracy evaluation on Wan2.2-A14B shows this
-is sufficient to meet quality requirements and is the recommended setting.
+(`num_bf16_fallback_layers=5`). This is an implementation default; select and
+validate the BF16 policy against your own quality target.
 
 ```python
 omni = Omni(model="<your-model>", quantization="mxfp4_dualscale")
 ```
 
 ```bash
-python text_to_video.py --model <your-model> --quantization mxfp4_dualscale
+python examples/offline_inference/text_to_video/text_to_video.py --model <your-model> --quantization mxfp4_dualscale
 ```
 
 If accuracy debugging identifies additional precision-sensitive layers, they
@@ -316,21 +322,22 @@ omni = Omni(
     model="<your-model>",
     quantization_config={
         "method": "mxfp4_dualscale",
-        "ignored_layers": ["blocks.10.attn1.to_q"],   # explicit per-layer override
+        "ignored_layers": ["blocks.10.attn1.to_qkv"],   # explicit per-layer override
     },
 )
 ```
 
 BF16 fallback routing in online mode applies two rules in priority order:
 
-1. **`ignored_layers`** (explicit per-layer override): any layer whose prefix
-   matches is kept in BF16 regardless of block index.
+1. **`ignored_layers`** (explicit per-layer override): a listed runtime Linear
+   module is kept in BF16 regardless of block index. Use exact module paths,
+   not arbitrary block prefixes or names ending in `.weight`.
 2. **`num_bf16_fallback_layers`** (coarse leading-block rule): the first N
    transformer blocks (`blocks.0` … `blocks.N-1`) fall back to BF16. Defaults
-   to `5` (recommended). Layers outside `blocks.N.*`
-   (e.g. `condition_embedder`) are always quantized.
+   to `5`. Layers outside `blocks.N.*` are quantized unless explicitly listed
+   in `ignored_layers`.
 
-### `mxfp4_dualscale` — DualScale Offline Mode (Recommended)
+### `mxfp4_dualscale` — DualScale Offline Mode
 
 Offline mode loads a pre-quantized DualScale checkpoint from msModelSlim. A
 preprocessing step converts the raw quantized output to the diffusers format
@@ -431,14 +438,14 @@ The `quantization_config` injected into `config.json` for each transformer:
 ```
 
 `ignored_layers` lists every linear layer that retains its original BF16 weight,
-using vllm-omni model parameter names (QKV-fused, FFN underscored, `to_out`
+using vllm-omni runtime module paths (QKV-fused, FFN underscored, `to_out`
 unindexed). The exact entries are determined by the quantization tool (msModelSlim)
 and may differ between `transformer` and `transformer_2` in a cascade model.
 
 #### Step 3 — Serve
 
 ```bash
-python text_to_video.py --model /path/to/Wan2.2-T2V-A14B-MXFP4-DualScale
+python examples/offline_inference/text_to_video/text_to_video.py --model /path/to/Wan2.2-T2V-A14B-MXFP4-DualScale
 
 # Online serving
 vllm serve /path/to/Wan2.2-T2V-A14B-MXFP4-DualScale --omni
@@ -460,9 +467,10 @@ omni = Omni(model="/path/to/Wan2.2-T2V-A14B-MXFP4-DualScale")
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |
 | `method` | str | — | `"mxfp4"` |
-| `mxfp4_scale_alg` | int | `0` | `0`: OCP MX; `2`: UOS A4 quantization with `dst_type_max=7.25`; A8 remains OCP MX |
+| `mxfp4_scale_alg` | int | `0` | MXFP4 block scaling: `0` OCP MX, `2` UOS (`Qmax=7.25`, NPU only). Online: W4 and A4; offline: A4 only. A8 remains OCP MXFP8 |
+| `is_checkpoint_mxfp4_serialized` | bool | `false` | Load pre-quantized single-scale weights and scales; declared in checkpoint `config.json` |
 | `require_smooth_scale` | bool | `false` | Require calibrated Smooth tensors for offline single-scale weights |
-| `ignored_layers` | list[str] | `[]` | Layer prefixes to keep in BF16 |
+| `ignored_layers` | list[str] | `[]` | Exact runtime Linear module paths to keep in BF16 |
 | `w4a8_fallback_layers` | list[str] | `[]` | Exact runtime Linear paths that always use A8; NPU only |
 | `w4a8_fallback_steps` | list[int] | `[]` | Zero-based denoise steps that use A8; NPU only |
 
@@ -472,8 +480,8 @@ omni = Omni(model="/path/to/Wan2.2-T2V-A14B-MXFP4-DualScale")
 | ----------- | ------ | --------- | ------------- |
 | `method` | str | — | `"mxfp4_dualscale"` |
 | `is_checkpoint_serialized` | bool | `False` | `True` for offline DualScale checkpoints; auto-set from `config.json` when using the preprocessing script |
-| `ignored_layers` | list[str] | `[]` | Layer prefixes to keep in BF16. **Works in both modes**: offline — populated by the merge script for interleaved sensitive layers; online — user-supplied for explicit per-layer precision override |
-| `num_bf16_fallback_layers` | int | `5` | **Online mode only**: leading N transformer blocks (`blocks.0` … `blocks.N-1`) kept in BF16. Applied after `ignored_layers`; ignored in offline mode. Default of `5` is the evaluated recommended value for Wan2.2-A14B |
+| `ignored_layers` | list[str] | `[]` | Exact runtime Linear module paths to keep in BF16. **Works in both modes**: offline — populated by the merge script for interleaved sensitive layers; online — user-supplied for explicit per-layer precision override |
+| `num_bf16_fallback_layers` | int | `5` | **Online mode only**: leading N transformer blocks (`blocks.0` … `blocks.N-1`) kept in BF16. Applied after `ignored_layers`; ignored in offline mode. Validate the default of `5` against the intended model and quality target |
 | `w4a8_fallback_layers` | list[str] | `[]` | Must remain empty; DualScale does not support W4A8 fallback |
 | `w4a8_fallback_steps` | list[int] | `[]` | Must remain empty; DualScale does not support W4A8 fallback |
 
@@ -503,7 +511,7 @@ unless they appear in `ignored_layers`.
    explicit `ignored_layers` stay in BF16 for accuracy.
 
 3. **Offline dual-scale (`mxfp4_dualscale`, `is_checkpoint_serialized=True`)** —
-   **recommended for production** — loads four tensors per quantized layer: FP4
+   loads four tensors per quantized layer: FP4
    weight, fine scale (`uint8` reinterpreted as `float8_e8m0fnu`), coarse scale
    (`float32`), and per-input-channel `mul_scale` (`float32`). BF16 fallback
    layers have no quantization tensors and are routed via `ignored_layers`.
@@ -512,21 +520,21 @@ unless they appear in `ignored_layers`.
    layout as `float8_e8m0fnu`) and reinterpreted at load time without a lossy
    float32 round-trip.
 
-5. **Cascade model config propagation**: in a cascade model (transformer +
-   transformer_2), vLLM-Omni reads each transformer's own `config.json` and
-   rebuilds the quant config locally when `ignored_layers` differs between
-   transformers, ensuring per-layer routing is accurate for each. The first
-   transformer's config is propagated to `od_config` so the second transformer
-   can reuse it as a starting point.
+5. **Cascade model configuration**: checkpoint auto-detection resolves each
+   expert's own `config.json` independently; the first expert's detected config
+   is not reused as the second expert's policy. An explicit global runtime
+   config applies to both experts, while per-component configs select policies
+   by the exact `transformer` / `transformer_2` names. Serialized checkpoint
+   metadata still determines each expert's storage format and BF16 layers.
 
 6. **Self-attention QKV fusion**: Q, K, V projection weights are fused into a
    single `QKVParallelLinear` layer at runtime. `ignored_layers` entries use the
    fused name (`attn1.to_qkv`), written automatically by the merge script.
 
-7. W4A4 carries higher quantization noise than W8A8 (16 vs 256 levels). The
-   DualScale offline method mitigates this with calibrated `mul_scale` smooth
-   quantization. Use `ignored_layers` and `num_bf16_fallback_layers` to trade
-   off compression vs. accuracy for precision-sensitive layers.
+7. FP4 has fewer representable values than FP8, so evaluate quantization
+   error and generation quality for the chosen recipe. Offline Smooth scaling
+   and BF16 fallback can help with sensitive layers.
+   `num_bf16_fallback_layers` applies only to online DualScale.
 
 ## Adapting MXFP4 for a New Model
 
@@ -537,21 +545,20 @@ a merge script for offline checkpoints.
 
 ### Step 1 — Discover runtime layer names
 
-`ignored_layers` entries must match the **runtime parameter names** used inside
-vllm-omni, which may differ from the names stored in the diffusers checkpoint.
-The canonical source of truth is the model's own `named_parameters()`.
+`ignored_layers` entries use exact **runtime Linear module paths**, without
+`.weight`. Inspect the actual transformer instance in model initialization or
+a developer harness; `Omni` does not expose an `omni.pipeline.transformer` API.
+For a transformer instance named `transformer`:
 
 ```python
-from vllm_omni import Omni
+from vllm.model_executor.layers.linear import LinearBase
 
-# Load the model without quantization to inspect parameter names.
-omni = Omni(model="/path/to/your-model")  # no --quantization flag
-for name, _ in omni.pipeline.transformer.named_parameters():
-    if "weight" in name and "scale" not in name:
+for name, module in transformer.named_modules():
+    if isinstance(module, LinearBase):
         print(name)
 ```
 
-Compare the printed names against the diffusers checkpoint keys
+Compare these module paths against the corresponding diffusers checkpoint keys
 (`safetensors.safe_open` or `torch.load`) to identify any renames your model
 applies. Common patterns that differ in Wan2.2 (and may appear in other
 models):
@@ -569,8 +576,9 @@ fused runtime parameters.
 
 !!! warning "Partial QKV fallback is not allowed"
     If your model fuses Q, K, V into a single layer, `ignored_layers` must
-    include **all three or none**. A partial fallback (e.g. `to_q` in BF16 but
-    `to_k`, `to_v` quantized) cannot be expressed at runtime because they share
+    name the fused runtime module (for Wan, `attn1.to_qkv`). The source
+    checkpoint must keep **all three or none** in BF16. A partial fallback
+    (e.g. `to_q` in BF16 but `to_k`, `to_v` quantized) cannot be expressed at runtime because they share
     one `QKVParallelLinear`. The merge script enforces this and raises an error
     if only some of the trio appear as non-quantized.
 
@@ -579,12 +587,13 @@ fused runtime parameters.
 #### Online mode
 
 Pass `ignored_layers` directly in the quantization config using the **runtime
-names** discovered in Step 1. No code changes to the model are required.
+names** discovered in Step 1. This assumes the model already passes its
+quantization config and module prefixes to compatible vLLM Linear layers.
 
 ```python
 omni = Omni(
     model="/path/to/your-model",
-    quantization={
+    quantization_config={
         "method": "mxfp4_dualscale",
         "ignored_layers": [
             "blocks.0.attn1.to_qkv",   # runtime name, not diffusers name
@@ -596,9 +605,14 @@ omni = Omni(
 ```
 
 ```bash
-# CLI does not support list-typed ignored_layers directly.
-# Use the Python API or set ignored_layers in config.json (offline).
-python your_script.py --model /path/to/your-model --quantization mxfp4_dualscale
+# The text-to-video example accepts list-valued fields through JSON.
+python examples/offline_inference/text_to_video/text_to_video.py \
+    --model /path/to/your-model \
+    --quantization-config '{"method":"mxfp4_dualscale","ignored_layers":["blocks.0.attn1.to_qkv"]}'
+
+# Serving accepts the same configuration.
+vllm serve /path/to/your-model --omni \
+    --diffusion-quantization-config '{"method":"mxfp4_dualscale","ignored_layers":["blocks.0.attn1.to_qkv"]}'
 ```
 
 The `num_bf16_fallback_layers` coarse rule is an alternative to listing layers
@@ -623,9 +637,13 @@ the merge script is correct. The injected block:
 }
 ```
 
-To add a layer manually (e.g. to pin an additional layer to BF16 without
-re-running the merge script), edit `config.json` inside the transformer
-subfolder. Use runtime names, not diffusers checkpoint names.
+Adding an offline BF16 fallback layer requires both the original BF16 weight
+from the base model and a matching `ignored_layers` entry. Regenerate the
+checkpoint with the revised storage policy, restoring the original weight
+(and bias, if present) and removing that layer's quantization tensors.
+Editing `config.json` alone does not reconstruct BF16 weights from stored FP4
+values. For fused QKV, restore all three projections together. Use runtime
+module paths in `ignored_layers`.
 
 ### Step 3 — Write a merge script for offline mode
 
@@ -661,6 +679,7 @@ renaming rules and collect the results.
 !!! tip "Validate before serving"
     After producing the offline checkpoint, load it without a `--quantization`
     flag and verify that vLLM-Omni auto-detects the correct method. Check that
-    the layer count reported in the startup log matches expectations: quantized
-    layer count + `ignored_layers` count should equal total linear layer count.
-    Any mismatch indicates a name-mapping bug in the merge script.
+    each intended runtime Linear module resolves to the expected quantized or
+    BF16 method and that every BF16 entry has original BF16 weights. Account
+    for fused modules and, in online DualScale, the leading-block fallback rule;
+    the raw length of `ignored_layers` alone is not a reliable layer count.
