@@ -378,7 +378,8 @@ class NPUMxfp4LinearMethod(MXFPLinearMethodBase):
         )
         setattr(layer.mul_scale, "ignore_warning", True)
         setattr(layer.mul_scale, "is_checkpoint_optional", not self.quant_config.require_smooth_scale)
-        setattr(layer.weight_scale, "is_checkpoint_required", True)
+        if self.quant_config.is_checkpoint_mxfp4_serialized:
+            setattr(layer.weight_scale, "is_checkpoint_required", True)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):

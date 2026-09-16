@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CPU coverage for offline Smooth loading and the W4A8 dtype contract."""
+"""CPU coverage for MXFP4 checkpoint loading and the W4A8 dtype contract."""
 
 import sys
 from types import ModuleType
@@ -22,6 +22,7 @@ from vllm_omni.quantization.mxfp4_config import (
     DiffusionMXFP4DualScaleMixedConfig,
     NPUMxfp4DualScaleLinearMethod,
     NPUMxfp4LinearMethod,
+    NPUMxfp4OnlineLinearMethod,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -62,6 +63,57 @@ def _load_checkpoint(layer, config, weights, monkeypatch):
     loader.counter_before_loading_weights = 0.0
     monkeypatch.setattr(loader, "get_all_weights", lambda model: iter(weights.items()))
     loader.load_weights(layer)
+
+
+@pytest.mark.parametrize("serialized", [False, True])
+def test_single_scale_requires_checkpoint_scale_only_when_serialized(serialized, monkeypatch):
+    config = DiffusionMXFP4Config(is_checkpoint_mxfp4_serialized=serialized)
+    # Exercise the shared implementation directly as well as the online MRO
+    # below: checkpoint requirements must follow the configured storage mode.
+    layer = _CheckpointLayer(NPUMxfp4LinearMethod(config))
+    weights = {"weight": torch.ones((2, 512), dtype=torch.bfloat16)}
+    if serialized:
+        with pytest.raises(ValueError, match="Required weights.*weight_scale"):
+            _load_checkpoint(layer, config, weights, monkeypatch)
+    else:
+        _load_checkpoint(layer, config, weights, monkeypatch)
+
+
+@pytest.mark.parametrize("scale_alg", [0, 2])
+def test_online_mxfp4_loads_bf16_checkpoint_without_scale(scale_alg, monkeypatch):
+    config = DiffusionMXFP4Config(mxfp4_scale_alg=scale_alg)
+    method = NPUMxfp4OnlineLinearMethod(config)
+    layer = _CheckpointLayer(method)
+    assert set(dict(layer.named_parameters())) == {"weight"}
+    assert layer.weight.is_meta
+
+    weight = torch.arange(1024, dtype=torch.bfloat16).reshape(2, 512)
+    packed_weight = torch.zeros((2, 256), dtype=torch.uint8)
+    generated_scale = torch.full((2, 16), 127, dtype=torch.uint8)
+    quantized_inputs = []
+
+    def quantize(value, **kwargs):
+        quantized_inputs.append(value.clone())
+        expected = dict(dst_type="fp4", axis=-1, block_size=32, round_mode="rint", scale_alg=scale_alg)
+        if scale_alg == 2:
+            expected["dst_type_max"] = 7.25
+        assert kwargs == expected
+        return packed_weight, generated_scale
+
+    # Keep real creation, lazy loading, processing, and strict loader checks;
+    # substitute only the device quantization operator for this CPU test.
+    npu = ModuleType("torch_npu")
+    npu.__dict__.update(float4_e2m1fn_x2="fp4", npu_dynamic_mx_quant=quantize)
+    monkeypatch.setitem(sys.modules, "torch_npu", npu)
+    _load_checkpoint(layer, config, {"weight": weight}, monkeypatch)
+
+    assert len(quantized_inputs) == 1
+    torch.testing.assert_close(quantized_inputs[0], weight, rtol=0, atol=0)
+    torch.testing.assert_close(layer.weight, packed_weight, rtol=0, atol=0)
+    torch.testing.assert_close(layer.weight_scale, generated_scale.reshape(2, 8, 2), rtol=0, atol=0)
+    assert not getattr(layer.weight_scale, "is_checkpoint_required", False)
+    method.process_weights_after_loading(layer)
+    assert len(quantized_inputs) == 1
 
 
 @pytest.mark.parametrize("require_smooth", [False, True])
