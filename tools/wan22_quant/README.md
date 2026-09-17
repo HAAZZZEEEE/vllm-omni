@@ -12,6 +12,7 @@
 ## 快速开始
 
 ```bash
+cd tools/wan22_quant
 cp env.example.sh env.sh
 vi env.sh                     # 只改这一个文件
 bash run.sh   /absolute/path/env.sh    # 导出 → 转换 → 校验
@@ -29,7 +30,7 @@ bash smoke.sh /absolute/path/env.sh    # 用上一步的 model/ 生成一个视�
 完整示例见 `env.example.sh`，每个变量都有注释。必填项：
 
 | 变量 | 含义 |
-|---|---|
+| --- | --- |
 | `NATIVE_MODEL` | 原始 Wan2.2-T2V-A14B（导出输入，含 `high_noise_model`/`low_noise_model`） |
 | `BF16_DIFFUSERS_MODEL` | 配套的原始 BF16 Diffusers 模型（转换输入，必须含 `transformer/` 与 `transformer_2/`） |
 | `BF16_DIFFUSERS_COMPONENT_ROOT` | 可选。当上面这个目录里的 `scheduler`/`text_encoder`/`tokenizer`/`vae` 是指向 `/models/...` 的绝对软链时，把该目录挂到容器的 `/models` |
@@ -45,7 +46,7 @@ bash smoke.sh /absolute/path/env.sh    # 用上一步的 model/ 生成一个视�
 
 ## 输出位置
 
-```
+```text
 $OUTPUT_ROOT/
 ├── native/      # msModelSlim 双专家导出（high_noise_model/、low_noise_model/）
 ├── model/       # 转换后的 Omni checkpoint（含 mxfp4_conversion_report.json）
@@ -74,7 +75,7 @@ $OUTPUT_ROOT/
 运行时转换工具会把 `mxfp4_scale_alg=2`（A4 显式 UOS）写入**两个**专家的
 `quantization_config`，同时保留自动生成的 `ignored_layers` 与
 `is_checkpoint_mxfp4_serialized`，并要求 Smooth。该取值是固定配方的显式选择，
-由 `--mxfp4-scale-alg 2` 传入并记入 `mxfp4_conversion_report.json` 的
+由入口显式传入 `--mxfp4-scale-alg 2`（独立转换 CLI 同样默认 `2`），并记入 `mxfp4_conversion_report.json` 的
 `runtime_scale_alg` 字段，不是无来源的全局默认。
 
 ## 成功标准
@@ -82,7 +83,7 @@ $OUTPUT_ROOT/
 `run.sh` 退出码 0，且：
 
 1. `logs/run.log` 出现 `==== [2/4] 校验原生导出结构 ====` 的结构校验通过输出；
-2. `native/` 下只有 `high_noise_model/`、`low_noise_model/` 两个专家目录；
+2. `native/` 下包含 `high_noise_model/`、`low_noise_model/` 两个专家目录；生产工具也可能保存配方和校准缓存；
 3. `model/` 下两个专家的 `config.json` 的 `quantization_config` 含
    `quant_method=mxfp4`、`is_checkpoint_mxfp4_serialized=true`、
    `require_smooth_scale=true`、`mxfp4_scale_alg=2` 和非空 `ignored_layers`；
@@ -94,10 +95,10 @@ $OUTPUT_ROOT/
 
 ## 本次实测（2026-09-16）
 
-在 184（k8s-node-01）用 **同一台机器**跑完 导出→转换→校验→出片，全程未搬动 checkpoint。
+在同一台 A5 机器上完成导出、转换、校验和出片。首次入口执行在最终对账阶段遇到校验器参数名不匹配；修正后复用本次导出和转换产物，全量对账及视频冒烟通过。交付代码已包含该修正，未重新执行整条导出入口。
 
 | 项 | 结果 |
-|---|---|
+| --- | --- |
 | 导出 | msModelSlim 双专家，NPU2，单级 W4A4_MXFP4；`native/` 22G，每专家 350 量化层 / 350 Smooth 层 |
 | 导出描述哈希 | `eb6a64dbc0ef11a7191fe55581290166a29f6cbe2eeb70b8b835baa5a48e8f31`（与历史 C7 导出一致） |
 | 结构校验 | `EXPORT_STRUCTURE_VALIDATED` |
@@ -106,18 +107,16 @@ $OUTPUT_ROOT/
 | 视频 | 退出码 0，33 帧全解码，832×480、16fps、h264，sha256 `ee46b729a498f85b16253b062da32b3e01d005c846391f546500437f79a4cb6e` |
 | 移出测试 | 78 passed，退出码 0 |
 
-视频哈希与 Task7 已验证产物**逐字节相同**，说明重新导出的权重与已验证 checkpoint 数值等价。
+该配置下视频与此前验证产物逐字节相同；这只证明本次视频一致，不证明两个检查点的全部权重数值等价。转换保真由本次原生导出与转换产物的逐张量对账验证。
 
 > **建议在同一台机器上跑完两条入口。** `model/` 约 66G，把它搬到另一台机器只为出片并不划算；
 > 换机器真正需要携带的只有已验证的 `OMNI_SOURCE` 源码树（约 75MB）和
 > `ADALAYERNORM_PATCH`（约 5KB）。本次视频就是在转换节点本机出片的。
 
-
-
 导出镜像与关键版本（实测）：
 
 | 项 | 值 |
-|---|---|
+| --- | --- |
 | 镜像 | `quay.io/ascend/vllm-omni:v0.28.0-a5` |
 | Python | 3.12.13 |
 | torch / torch_npu | 2.10.0+cpu / 2.10.0.post4 |
@@ -132,7 +131,7 @@ Wan2.2 源码在 import 期就会拉 mindiesd（`wan/utils/rainfusion.py`），�
 
 必须是与该 Python/torch 匹配的 **cp312 x86_64** 版本：
 
-```
+```text
 mindiesd-3.1.0-cp312-cp312-manylinux_2_34_x86_64.whl
 sha256 5e4831331c2b9ab76d42195bec2fd4352625fdd87815bf0e4d7a13c344add7ee
 ```
@@ -197,7 +196,7 @@ python3 -m pytest --confcutdir=tests tests/test_mxfp4_single_checkpoint_conversi
 ## 目录内容
 
 | 路径 | 作用 |
-|---|---|
+| --- | --- |
 | `run.sh` / `smoke.sh` | 导出→转换→校验；单片推理 |
 | `env.example.sh` | 用户唯一需要改的文件 |
 | `c7-smooth.yaml` | 固定 C7/UOS+Smooth 配方（`dataset` 固定为 `/dataset/index.jsonl`） |
