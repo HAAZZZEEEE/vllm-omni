@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.layers.fused_norm_rope import FusedNormRope, prepare_rope_tables
 from vllm_omni.diffusion.models.qwen_image_21 import qkv_norm_rope as fusion
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -42,10 +45,21 @@ def test_unsupported_configuration(monkeypatch, field, value):
     assert not fusion.use_mindiesd_qkv(cfg, native_cache=True, unquantized=True)
 
 
+def test_enabled_requires_public_mindiesd_interface(monkeypatch):
+    from vllm_omni.platforms import npu
+
+    monkeypatch.setattr(fusion.current_omni_platform, "is_npu", lambda: True)
+    monkeypatch.setattr(npu, "is_a5", lambda: True)
+    monkeypatch.setitem(sys.modules, "mindiesd", SimpleNamespace())
+    assert not fusion.use_mindiesd_qkv(config(True), native_cache=True, unquantized=True)
+    monkeypatch.setitem(sys.modules, "mindiesd", SimpleNamespace(norm_rope_concat=lambda *args: None))
+    assert fusion.use_mindiesd_qkv(config(True), native_cache=True, unquantized=True)
+
+
 def test_rope_preserves_positions_and_pair_order():
     angles = torch.tensor([[0.1, 0.7], [1.2, -0.3]])
     freqs = torch.polar(torch.ones_like(angles), angles)
-    sin, cos = fusion.prepare_rope_tables(freqs, torch.bfloat16)
+    sin, cos = prepare_rope_tables(freqs, torch.bfloat16)
     torch.testing.assert_close(sin, angles.sin().repeat_interleave(2, -1).bfloat16(), rtol=0, atol=0)
     torch.testing.assert_close(cos, angles.cos().repeat_interleave(2, -1).bfloat16(), rtol=0, atol=0)
 
@@ -64,8 +78,8 @@ def test_adapter_contiguous_inputs_and_output_layout(monkeypatch):
         assert "encoder_key" not in kwargs
         return tuple(x.transpose(1, 2).contiguous() for x in (query, key, value))
 
-    monkeypatch.setattr(torch.ops.mindiesd, "norm_rope_concat", op, raising=False)
-    outputs = fusion.mindiesd_qkv_norm_rope(q, k, v, weight, weight, 1e-6, tables)
+    monkeypatch.setitem(sys.modules, "mindiesd", SimpleNamespace(norm_rope_concat=op))
+    outputs = FusedNormRope().forward_npu(q, k, v, weight, weight, 1e-6, tables)
     for actual, expected in zip(outputs, (q, k, v)):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert len(calls) == 1
@@ -75,11 +89,11 @@ def test_operator_failure_is_not_silently_fallback(monkeypatch):
     def fail(*args, **kwargs):
         raise RuntimeError("device kernel failed")
 
-    monkeypatch.setattr(torch.ops.mindiesd, "norm_rope_concat", fail, raising=False)
+    monkeypatch.setitem(sys.modules, "mindiesd", SimpleNamespace(norm_rope_concat=fail))
     x = torch.ones(1, 2, 1, 128, dtype=torch.bfloat16)
     w = torch.ones(128, dtype=x.dtype)
     with pytest.raises(RuntimeError, match="device kernel failed"):
-        fusion.mindiesd_qkv_norm_rope(x, x, x, w, w, 1e-6, (x[0, :, 0], x[0, :, 0]))
+        FusedNormRope().forward_npu(x, x, x, w, w, 1e-6, (x[0, :, 0], x[0, :, 0]))
 
 
 def test_cache_receives_rotated_prefix_once_and_keeps_cfg_branches_separate(monkeypatch):
@@ -106,6 +120,7 @@ def test_cache_receives_rotated_prefix_once_and_keeps_cfg_branches_separate(monk
     attention.to_qkv = PackedProjection()
     attention.norm_q = torch.nn.RMSNorm(128, eps=1e-6)
     attention.norm_k = torch.nn.RMSNorm(128, eps=1e-6)
+    attention.fused_norm_rope = FusedNormRope()
     attention.attn = CaptureAttention()
     attention.to_out = torch.nn.Identity()
     lengths = []
@@ -114,7 +129,7 @@ def test_cache_receives_rotated_prefix_once_and_keeps_cfg_branches_separate(monk
         lengths.append(q.shape[1])
         return q + 10, k + 20, v
 
-    monkeypatch.setattr(model, "mindiesd_qkv_norm_rope", fused)
+    monkeypatch.setattr(attention.fused_norm_rope, "_forward_method", fused)
     tables = (torch.empty(0), torch.empty(0))
     cache: dict[str, dict[str, torch.Tensor]] = {}
     attention(torch.ones(1, 5, 384), torch.empty(0), kv_cache=cache, cache_write_len=3, qkv_rope_tables=tables)

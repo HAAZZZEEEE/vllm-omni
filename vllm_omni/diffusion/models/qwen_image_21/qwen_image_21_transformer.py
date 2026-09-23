@@ -33,13 +33,9 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.layers.fused_norm_rope import FusedNormRope, RopeTables, prepare_rope_tables
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
-from vllm_omni.diffusion.models.qwen_image_21.qkv_norm_rope import (
-    RopeTables,
-    mindiesd_qkv_norm_rope,
-    prepare_rope_tables,
-    use_mindiesd_qkv,
-)
+from vllm_omni.diffusion.models.qwen_image_21.qkv_norm_rope import use_mindiesd_qkv
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -466,6 +462,7 @@ class QwenImage21Attention(nn.Module):
         # Keep that rounding order for BF16 Q/K; TP shards whole heads.
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
+        self.fused_norm_rope = FusedNormRope()
 
         self.to_out = RowParallelLinear(
             heads * dim_head,
@@ -541,7 +538,7 @@ class QwenImage21Attention(nn.Module):
             query = self._apply_rotary_emb(query, freqs)
             key = self._apply_rotary_emb(key, freqs)
         else:
-            query, key, value = mindiesd_qkv_norm_rope(
+            query, key, value = self.fused_norm_rope(
                 query,
                 key,
                 value,
