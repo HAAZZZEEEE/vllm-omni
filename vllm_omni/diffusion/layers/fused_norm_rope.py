@@ -18,7 +18,11 @@ def prepare_rope_tables(freqs: torch.Tensor, dtype: torch.dtype) -> RopeTables:
 
 
 class FusedNormRope(CustomOp):
-    """Stateless adapter; the model's existing norm_q/norm_k own their weights."""
+    """Stateless adapter; the model's existing norm_q/norm_k own their weights.
+
+    NPU uses MindIE-SD. Other backends compose PyTorch normalization and RoPE
+    operations so the layer retains a working unfused implementation.
+    """
 
     def forward_npu(
         self,
@@ -69,3 +73,51 @@ class FusedNormRope(CustomOp):
             )
 
         return norm_rope(query, q_weight), norm_rope(key, k_weight), value
+
+    def forward_cuda(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        eps: float,
+        tables: RopeTables,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.forward_native(query, key, value, q_weight, k_weight, eps, tables)
+
+    def forward_hip(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        eps: float,
+        tables: RopeTables,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.forward_native(query, key, value, q_weight, k_weight, eps, tables)
+
+    def forward_xpu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        eps: float,
+        tables: RopeTables,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.forward_native(query, key, value, q_weight, k_weight, eps, tables)
+
+    def forward_musa(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        eps: float,
+        tables: RopeTables,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.forward_native(query, key, value, q_weight, k_weight, eps, tables)

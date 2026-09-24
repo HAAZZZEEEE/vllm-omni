@@ -7,8 +7,10 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.layers import custom_op
 from vllm_omni.diffusion.layers.fused_norm_rope import FusedNormRope, prepare_rope_tables
 from vllm_omni.diffusion.models.qwen_image_21 import qkv_norm_rope as fusion
 
@@ -62,6 +64,50 @@ def test_rope_preserves_positions_and_pair_order():
     sin, cos = prepare_rope_tables(freqs, torch.bfloat16)
     torch.testing.assert_close(sin, angles.sin().repeat_interleave(2, -1).bfloat16(), rtol=0, atol=0)
     torch.testing.assert_close(cos, angles.cos().repeat_interleave(2, -1).bfloat16(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("backend", ["native", "cuda", "rocm", "xpu", "musa"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_unfused_backend_dispatch_uses_small_ops(monkeypatch, backend, dtype):
+    methods = {
+        "native": "forward_native",
+        "cuda": "forward_cuda",
+        "rocm": "forward_hip",
+        "xpu": "forward_xpu",
+        "musa": "forward_musa",
+    }
+    platform = SimpleNamespace(
+        **{f"is_{name}": lambda name=name: name == backend for name in ("rocm", "cuda", "npu", "xpu", "musa")}
+    )
+    monkeypatch.setattr(custom_op, "current_omni_platform", platform)
+    monkeypatch.setitem(sys.modules, "mindiesd", None)
+    layer = FusedNormRope()
+    assert layer._forward_method.__func__ is getattr(FusedNormRope, methods[backend])
+
+    torch.manual_seed(42)
+    query = torch.randn(1, 3, 2, 8, dtype=dtype)
+    key = torch.randn(1, 3, 1, 8, dtype=dtype)
+    value = torch.randn_like(key)
+    q_weight = torch.linspace(0.5, 1.5, 8, dtype=dtype)
+    k_weight = torch.linspace(1.5, 0.5, 8, dtype=dtype)
+    angles = torch.randn(3, 4)
+    tables = prepare_rope_tables(torch.polar(torch.ones_like(angles), angles), dtype)
+    eps = 1e-6
+
+    def reference(x, weight):
+        normalized = F.rms_norm(x.float(), (x.shape[-1],), weight.float(), eps).to(dtype)
+        # Compute pairwise rotation with complex multiplication, independently
+        # of the real-valued pair shuffle in forward_native.
+        phase = torch.complex(tables[1][..., ::2].float(), tables[0][..., ::2].float())
+        pairs = torch.view_as_complex(normalized.float().reshape(*normalized.shape[:-1], -1, 2).contiguous())
+        return torch.view_as_real(pairs * phase[None, :, None]).reshape_as(x).to(dtype)
+
+    actual_q, actual_k, actual_v = layer(query, key, value, q_weight, k_weight, eps, tables)
+    tolerance = 1e-2 if dtype == torch.bfloat16 else 1e-6
+    torch.testing.assert_close(actual_q, reference(query, q_weight), rtol=tolerance, atol=tolerance)
+    torch.testing.assert_close(actual_k, reference(key, k_weight), rtol=tolerance, atol=tolerance)
+    assert actual_v is value
+    assert actual_q.shape == query.shape and actual_k.shape == key.shape
 
 
 def test_adapter_contiguous_inputs_and_output_layout(monkeypatch):
