@@ -9,11 +9,62 @@ import math
 import os
 import statistics
 import time
+from contextlib import contextmanager
 
 import pytest
 import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.npu, pytest.mark.diffusion]
+
+
+def _assert_route_hits(hits: dict[str, int], fused: bool) -> None:
+    if fused:
+        assert hits["prefill"] > 0, "MindIE-SD prefill did not execute"
+        assert hits["decode"] > 0, "MindIE-SD decode did not execute"
+        assert hits["concat"] > 0, "Head-major prefix concatenation did not execute"
+    else:
+        assert not any(hits.values()), f"Disabled arm used optimized routes: {hits}"
+
+
+@contextmanager
+def _observe_routes(monkeypatch, mindiesd):
+    from vllm_omni.diffusion.models.qwen_image_21 import qwen_image_21_transformer as module
+
+    hits = dict(prefill=0, decode=0, concat=0)
+    phase = None
+    forward = module.QwenImage21Attention.forward
+    norm_rope = mindiesd.norm_rope_concat
+    concat = module.concat_prefix_bnsd
+
+    @functools.wraps(forward)
+    def observe_attention(self, *args, **kwargs):
+        nonlocal phase
+        previous = phase
+        phase = "prefill" if kwargs.get("cache_write_len") is not None else "decode"
+        try:
+            return forward(self, *args, **kwargs)
+        finally:
+            phase = previous
+
+    @functools.wraps(norm_rope)
+    def observe_norm_rope(*args, **kwargs):
+        result = norm_rope(*args, **kwargs)
+        assert phase in ("prefill", "decode"), "Operator executed outside model attention"
+        hits[phase] += 1
+        return result
+
+    def observe_concat(prefix, current):
+        result = concat(prefix, current)
+        assert phase == "decode"
+        assert result.transpose(1, 2).is_contiguous(), "Concat lost head-major storage"
+        hits["concat"] += 1
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module.QwenImage21Attention, "forward", observe_attention)
+        patch.setattr(mindiesd, "norm_rope_concat", observe_norm_rope)
+        patch.setattr(module, "concat_prefix_bnsd", observe_concat)
+        yield hits
 
 
 @pytest.mark.skipif(
@@ -87,12 +138,21 @@ def test_mindiesd_qkv_full_request_ab(monkeypatch, tmp_path):
                         num_inference_steps=50,
                         num_outputs_per_prompt=1,
                     )
-                    torch.npu.synchronize()
-                    torch.npu.reset_peak_memory_stats()
-                    started = time.perf_counter()
-                    output = model.generate(prompt, sampling_params_list=[params], use_tqdm=False)
-                    torch.npu.synchronize()
-                    elapsed = time.perf_counter() - started
+                    if index < 2:
+                        # Observe complete warmups only; measured requests have no spies.
+                        with _observe_routes(monkeypatch, mindiesd) as hits:
+                            output = model.generate(prompt, sampling_params_list=[params], use_tqdm=False)
+                            torch.npu.synchronize()
+                            _assert_route_hits(hits, fused)
+                            print("QWEN21_ROUTES " + json.dumps({"scenario": scenario, "fused": fused, **hits}))
+                        elapsed = None
+                    else:
+                        torch.npu.synchronize()
+                        torch.npu.reset_peak_memory_stats()
+                        started = time.perf_counter()
+                        output = model.generate(prompt, sampling_params_list=[params], use_tqdm=False)
+                        torch.npu.synchronize()
+                        elapsed = time.perf_counter() - started
                     images = extract_images_from_outputs(output)
                     assert len(images) == 1 and images[0].size == (1024, 1024)
                     images[0].save(tmp_path / f"{scenario}-{fused}-{index}.png")

@@ -40,7 +40,8 @@ CPU dispatch, configuration, prefix ownership, and concatenation tests:
 ```bash
 python -m pytest -q \
   tests/diffusion/models/qwen_image_21/test_mindiesd_qkv.py \
-  tests/diffusion/models/qwen_image_21/test_prefix_concat.py
+  tests/diffusion/models/qwen_image_21/test_prefix_concat.py \
+  tests/diffusion/models/qwen_image_21/test_route_observation.py
 ```
 
 A5 operator correctness:
@@ -59,6 +60,10 @@ QWEN_IMAGE_21_TEST_IMAGE=/path/to/input.png \
 python -m pytest -q -s \
   tests/e2e/offline_inference/test_qwen_image_21_mindiesd.py
 ```
+
+Warmup requests assert zero optimized calls in the off arm and actual
+`mindiesd.norm_rope_concat` prefill/decode plus head-major prefix concatenation
+in the on arm. Measured requests run after all observation wrappers are removed.
 
 The image variable is optional; omit it to run T2I only. The test reports
 synchronized `Omni.generate` wall time and allocated/reserved memory peaks;
