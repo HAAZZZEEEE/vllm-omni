@@ -4,11 +4,13 @@
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.layers.fused_norm_rope import FusedNormRope, prepare_rope_tables
 
-pytestmark = [pytest.mark.core_model, pytest.mark.npu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
+@hardware_test(res={"npu": "A5"}, num_cards=1)
 @pytest.mark.parametrize("seq_len", [17, 1024, 1040, 4096, 4112, 16411])
 def test_fused_qkv_matches_model_rope(seq_len):
     pytest.importorskip("torch_npu")
