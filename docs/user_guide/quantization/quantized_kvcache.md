@@ -139,9 +139,23 @@ all other eligible forwards use `diffusion_kv_cache_dtype`.
 
 ### Qwen-Image-2.1 on Ascend
 
-Qwen-Image-2.1 prefill uses block-causal spans or a mask, which the NPU
-quantized attention runtime does not support. Keep that first denoising step
+Qwen-Image-2.1 prefill uses block-causal spans or a mask, which the current
+Omni NPU quantized attention path does not support. Keep that first denoising step
 in BF16 explicitly and quantize the subsequent dense decode calls:
+
+Save the following as `qwen21_mxfp8.yaml`:
+
+```yaml
+stages:
+  - stage_id: 0
+    diffusion_attention_config:
+      default:
+        backend: FLASH_ATTN
+    diffusion_kv_cache_dtype: mxfp8
+    diffusion_kv_cache_skip_steps: "0"
+```
+
+Pass this file through the offline script's supported `--deploy-config` option:
 
 ```bash
 python examples/offline_inference/text_to_image/text_to_image.py \
@@ -149,9 +163,7 @@ python examples/offline_inference/text_to_image/text_to_image.py \
     --prompt "A ceramic teapot on a wooden table" \
     --width 1024 --height 1024 --num-inference-steps 50 \
     --cfg-scale 1.0 --seed 42 --enforce-eager \
-    --diffusion-attention-backend FLASH_ATTN \
-    --diffusion-kv-cache-dtype mxfp8 \
-    --diffusion-kv-cache-skip-steps "0" \
+    --deploy-config qwen21_mxfp8.yaml \
     --output qwen21_mxfp8.png
 ```
 

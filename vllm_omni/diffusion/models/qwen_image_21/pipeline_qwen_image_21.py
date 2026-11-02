@@ -24,7 +24,7 @@ from torch import nn
 from transformers import AutoConfig, AutoModelForImageTextToText, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, is_quantized_attention_dtype
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage21 import (
     DistributedAutoencoderKLQwenImage21,
 )
@@ -1492,8 +1492,8 @@ class QwenImage21Pipeline(
         # Skip selectors affect the unified quantization knob only; native
         # precision and explicit backend quant specs do not vary with this step.
         split_by_step = (
-            self.od_config.diffusion_kv_cache_dtype not in (None, "auto", "float")
-            and bool(self.od_config.diffusion_kv_cache_skip_step_indices)
+            is_quantized_attention_dtype(getattr(self.od_config, "diffusion_kv_cache_dtype", None))
+            and bool(getattr(self.od_config, "diffusion_kv_cache_skip_step_indices", None))
             and len({state.step_index for state in states}) > 1
         )
         if self._needs_decode_seq_len_split(states) or split_by_step:

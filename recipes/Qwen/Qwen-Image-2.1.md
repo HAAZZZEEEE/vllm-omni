@@ -354,8 +354,9 @@ at this shape.
 ## Quantization
 
 For attention MXFP8 on Ascend, explicitly retain BF16 structural prefill with
-`--diffusion-kv-cache-skip-steps "0"` alongside
-`--diffusion-kv-cache-dtype mxfp8`. The skip selector applies to zero-based
+`diffusion_kv_cache_skip_steps: "0"` alongside
+`diffusion_kv_cache_dtype: mxfp8` in a deploy YAML. Pass the file to the
+offline script with `--deploy-config`. The skip selector applies to zero-based
 denoising steps in both whole-request and step-wise execution. See the
 [attention quantization configuration](../../docs/user_guide/quantization/quantized_kvcache.md#qwen-image-21-on-ascend)
 for a complete command and the mask, runtime and quality limitations. This

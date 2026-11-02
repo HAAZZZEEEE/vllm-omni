@@ -227,3 +227,58 @@ def test_step_mode_clears_context_after_failure(monkeypatch):
         with pytest.raises(RuntimeError, match="denoise failed"):
             pipe.denoise_step(InputBatch.make_batch([_state("a", 1, 1.0)]))
         assert get_forward_context().denoise_step_idx is None
+
+
+def test_step_mode_groups_mixed_prefix_lengths_and_steps(monkeypatch):
+    config = OmniDiffusionConfig(diffusion_kv_cache_dtype="mxfp8", diffusion_kv_cache_skip_steps="0,2")
+    pipe = _step_pipeline(config)
+    attention = _attention(config)
+    states = [_state("a", 1, 1.0), _state("b", 2, 2.0), _state("c", 2, 3.0), _state("d", 1, 4.0, rows=2)]
+    for state in states:
+        prefix_length = 2 if state.request_id == "b" else 1
+        state.extra["prefill_prompt_seq_len"] = prefix_length
+        state.extra["kv_cache"] = [
+            {"cond": {part: torch.zeros(state.latents.shape[0], prefix_length, 4) for part in ("key", "value")}}
+        ]
+    assert pipe._needs_decode_seq_len_split(states)
+    assert len({state.step_index for state in states}) > 1
+    seen = []
+
+    def predict(*args, **kwargs):
+        hidden = args[2]["hidden_states"]
+        seen.append(
+            (
+                get_forward_context().denoise_step_idx,
+                attention._with_kv_cache_dtype(None).extra["kv_cache_dtype"],
+                hidden[:, 0, 0].tolist(),
+            )
+        )
+        return hidden
+
+    monkeypatch.setattr(pipe, "predict_noise_maybe_with_cfg", predict)
+    with set_forward_context(omni_diffusion_config=config):
+        result = pipe.denoise_step(InputBatch.make_batch(states))
+        assert get_forward_context().denoise_step_idx is None
+    assert seen == [(1, "mxfp8", [1.0, 4.0, 4.0]), (2, "float", [2.0]), (2, "float", [3.0])]
+    torch.testing.assert_close(result[:, 0, 0], torch.tensor([1.0, 2.0, 3.0, 4.0, 4.0]))
+
+
+def test_step_mode_accepts_config_without_parsed_step_selector(monkeypatch):
+    config = OmniDiffusionConfig(diffusion_kv_cache_dtype="mxfp8")
+    # Remove both the instance field and its dataclass default to exercise a
+    # config producer that does not expose the optional parsed selector.
+    monkeypatch.delattr(config, "diffusion_kv_cache_skip_step_indices")
+    monkeypatch.delattr(OmniDiffusionConfig, "diffusion_kv_cache_skip_step_indices")
+    pipe = _step_pipeline(config)
+    calls = []
+
+    def predict(*args, **kwargs):
+        hidden = args[2]["hidden_states"]
+        calls.append(hidden.shape[0])
+        return hidden
+
+    monkeypatch.setattr(pipe, "predict_noise_maybe_with_cfg", predict)
+    with set_forward_context(omni_diffusion_config=config):
+        result = pipe.denoise_step(InputBatch.make_batch([_state("a", 1, 1.0), _state("b", 2, 2.0)]))
+    assert calls == [2]
+    torch.testing.assert_close(result[:, 0, 0], torch.tensor([1.0, 2.0]))

@@ -123,6 +123,9 @@ inherit another request's precision policy. With `None`, `auto`, or `float`,
 retaining a step selector does not introduce step-based splitting. Existing
 prefix-length compatibility grouping still applies. Explicit backend quant
 specs are not controlled by this step selector.
+The shared `is_quantized_attention_dtype` predicate classifies the unified
+precision knob for configuration validation, `Attention`, and pipeline batching;
+backend capability checks remain separate.
 This does not change backend selection or relax unsupported mask checks.
 
 The explicit Triton provider accepts H3 tile64/128 on SM80+ in BF16.
