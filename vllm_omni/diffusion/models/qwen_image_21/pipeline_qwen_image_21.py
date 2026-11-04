@@ -8,7 +8,7 @@ import json
 import logging
 import os
 from collections import OrderedDict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Hashable, Iterable
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -24,7 +24,7 @@ from torch import nn
 from transformers import AutoConfig, AutoModelForImageTextToText, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, is_quantized_attention_dtype
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage21 import (
     DistributedAutoencoderKLQwenImage21,
 )
@@ -56,6 +56,7 @@ from vllm_omni.diffusion.models.utils import create_transformers_model
 from vllm_omni.diffusion.offloader.config import offload_enabled
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.step_policy import DenoiseExecutionPolicy, ExactStep
 from vllm_omni.diffusion.utils.prompt_utils import (
     validate_prompt_sequence_lengths,
 )
@@ -1404,10 +1405,12 @@ class QwenImage21Pipeline(
         return QwenImage21Pipeline._group_states_by_key(states, QwenImage21Pipeline._decode_group_key)
 
     @staticmethod
-    def _group_by_prefix_lengths_and_step(states: list["StepRequestState"]) -> list[list["StepRequestState"]]:
-        """Also require one denoise step per group for the scalar step selector."""
+    def _group_by_prefix_lengths_and_policy(
+        states: list["StepRequestState"], step_keys: dict[int, Hashable]
+    ) -> list[list["StepRequestState"]]:
+        """Also require equivalent policies for every scalar-step consumer."""
         return QwenImage21Pipeline._group_states_by_key(
-            states, lambda state: (*QwenImage21Pipeline._decode_group_key(state), state.step_index)
+            states, lambda state: (*QwenImage21Pipeline._decode_group_key(state), step_keys[state.step_index])
         )
 
     @staticmethod
@@ -1494,26 +1497,32 @@ class QwenImage21Pipeline(
         if len({self._kv_cache_phase(state.extra.get("kv_cache")) for state in states}) > 1:
             raise ValueError("Cannot batch requests at mixed KV-cache phases. Schedule them separately.")
 
-        # Keep the scalar context truthful for both Attention step selectors and
-        # Linear step fallback. Equal-precision mixed steps need a separate
-        # execution-policy context before they can safely share a forward.
-        attention_uses_step = is_quantized_attention_dtype(
-            getattr(self.od_config, "diffusion_kv_cache_dtype", None)
-        ) and bool(getattr(self.od_config, "diffusion_kv_cache_skip_step_indices", None))
-        linear_uses_step = bool(getattr(getattr(self.transformer, "quant_config", None), "w4a8_fallback_steps", None))
-        split_by_step = (attention_uses_step or linear_uses_step) and len({state.step_index for state in states}) > 1
-        if self._needs_decode_seq_len_split(states) or split_by_step:
+        context = get_forward_context() if is_forward_context_available() else None
+        resolver = getattr(self.transformer, "get_execution_policy", None)
+        step_policies: dict[int, DenoiseExecutionPolicy | None] = {
+            step: resolver(step).with_consumer(context.paged_kv_runtime, step)
+            if context is not None and callable(resolver)
+            else None
+            for step in {state.step_index for state in states}
+        }
+        step_keys: dict[int, Hashable] = {
+            step: policy if policy is not None else ExactStep(step) for step, policy in step_policies.items()
+        }
+        split_by_policy = len(set(step_keys.values())) > 1
+        if self._needs_decode_seq_len_split(states) or split_by_policy:
             # Local import: InputBatch is only TYPE_CHECKING at module scope.
             from vllm_omni.diffusion.worker.input_batch import InputBatch as _InputBatch
 
             preds_by_id: dict[str, torch.Tensor] = {}
             groups = (
-                self._group_by_prefix_lengths_and_step(states)
-                if split_by_step
+                self._group_by_prefix_lengths_and_policy(states, step_keys)
+                if split_by_policy
                 else self._group_by_prefix_lengths(states)
             )
             for group in groups:
-                group_pred = self._denoise_step_homogeneous(_InputBatch.make_batch(group))
+                group_pred = self._denoise_step_homogeneous(
+                    _InputBatch.make_batch(group), execution_policy=step_policies[group[0].step_index]
+                )
                 if group_pred is None:
                     return None
                 offset = 0
@@ -1523,11 +1532,13 @@ class QwenImage21Pipeline(
                     offset += rows
             return torch.cat([preds_by_id[state.request_id] for state in states], dim=0)
 
-        return self._denoise_step_homogeneous(input_batch)
+        return self._denoise_step_homogeneous(input_batch, execution_policy=step_policies[states[0].step_index])
 
     def _denoise_step_homogeneous(
         self,
         input_batch: "InputBatch",
+        *,
+        execution_policy: DenoiseExecutionPolicy | None = None,
     ) -> torch.Tensor | None:
         """Run one denoise forward for a KV-compatible state group."""
         if self.interrupt:
@@ -1628,11 +1639,14 @@ class QwenImage21Pipeline(
         else:
             negative_kwargs = None
 
-        step_indices = {state.step_index for state in states}
         forward_context = get_forward_context() if is_forward_context_available() else None
         previous_step = forward_context.denoise_step_idx if forward_context is not None else None
+        previous_policy = forward_context.denoise_execution_policy if forward_context is not None else None
+        steps = {state.step_index for state in states}
         try:
-            set_forward_context_denoise_step_idx(next(iter(step_indices)) if len(step_indices) == 1 else None)
+            if forward_context is not None:
+                forward_context.denoise_execution_policy = execution_policy
+            set_forward_context_denoise_step_idx(next(iter(steps)) if len(steps) == 1 else None)
             noise_pred = self.predict_noise_maybe_with_cfg(
                 input_batch.do_true_cfg,
                 input_batch.true_cfg_scale,
@@ -1645,6 +1659,7 @@ class QwenImage21Pipeline(
             if forward_context is not None:
                 # Do not reactivate paged KV (or mask an error) while restoring.
                 forward_context.denoise_step_idx = previous_step
+                forward_context.denoise_execution_policy = previous_policy
 
         if take_ownership:
             # Remember the padded VLM length baked into the per-request KV so a

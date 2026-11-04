@@ -53,6 +53,11 @@ class _DiffusionKVRequestState:
 class DiffusionKVModelRunnerBackend:
     """Native paged-KV state and BlockTable operations for a model runner."""
 
+    def get_step_execution_key(self, step_idx: int) -> None:
+        # The worker installs request rows before forward. This object does not
+        # implement ensure_active() or consume the context's scalar step index.
+        return None
+
     def __init__(
         self,
         *,

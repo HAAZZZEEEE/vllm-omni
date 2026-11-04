@@ -284,11 +284,11 @@ def test_prefix_groups_preserve_both_cfg_lengths_and_request_order(include_step)
         state.extra["prefill_negative_prompt_seq_len"] = negative_prefix
         states.append(state)
 
-    group_requests = (
-        QwenImage21Pipeline._group_by_prefix_lengths_and_step
-        if include_step
-        else QwenImage21Pipeline._group_by_prefix_lengths
-    )
+    def group_requests(group_states):
+        if include_step:
+            return QwenImage21Pipeline._group_by_prefix_lengths_and_policy(group_states, {1: "mxfp8", 2: "float"})
+        return QwenImage21Pipeline._group_by_prefix_lengths(group_states)
+
     expected = [["a", "e"], ["b"], ["c"], ["d"]] if include_step else [["a", "b", "e"], ["c"], ["d"]]
     assert [[state.request_id for state in group] for group in group_requests(states)] == expected
     assert group_requests([]) == []

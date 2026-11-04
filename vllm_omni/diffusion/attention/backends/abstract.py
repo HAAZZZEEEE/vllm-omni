@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from abc import ABC, abstractmethod
+from collections.abc import Hashable
 from dataclasses import dataclass, field
 from typing import Any, Generic, Literal, TypeVar
 
@@ -11,6 +12,7 @@ from vllm_omni.diffusion.attention.capabilities import (
     ExecutionContext,
     ExecutionPathResult,
 )
+from vllm_omni.diffusion.step_policy import ExactStep
 from vllm_omni.platforms import current_omni_platform
 
 
@@ -327,6 +329,10 @@ T = TypeVar("T", bound=AttentionMetadata)
 
 
 class AttentionImpl(ABC, Generic[T]):
+    def get_step_execution_key(self, step_idx: int) -> Hashable:
+        """Unknown backend step dependencies conservatively prevent mixed-step batching."""
+        return ExactStep(step_idx)
+
     # Per-platform kv_cache_dtype support. Maps OmniPlatformEnum value
     # (e.g. "cuda", "npu") to the set of quantized dtypes that platform
     # handles.

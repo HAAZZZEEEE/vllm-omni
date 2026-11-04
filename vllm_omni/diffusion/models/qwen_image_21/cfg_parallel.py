@@ -129,7 +129,10 @@ class QwenImage21CFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
         """
         forward_context = get_forward_context() if is_forward_context_available() else None
         previous_step = forward_context.denoise_step_idx if forward_context is not None else None
+        previous_policy = forward_context.denoise_execution_policy if forward_context is not None else None
         try:
+            if forward_context is not None:
+                forward_context.denoise_execution_policy = None
             # Fresh cache for every generation: the pipeline is a singleton shared
             # across requests, so cache state must never leak between them.
             cache_enabled = getattr(self.transformer, "causal_condition", False)
@@ -208,4 +211,5 @@ class QwenImage21CFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
             if forward_context is not None:
                 # Restore the selector only; paged-KV activation belongs to the worker.
                 forward_context.denoise_step_idx = previous_step
+                forward_context.denoise_execution_policy = previous_policy
             self.transformer.release_request_geometry()

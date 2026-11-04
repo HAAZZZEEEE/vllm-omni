@@ -40,6 +40,7 @@ from vllm_omni.diffusion.layers.exact_bf16_qk_norm_rope import qk_rotary
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
 from vllm_omni.diffusion.models.qwen_image_21.npu_attention import QwenImage21SDPAImpl
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
+from vllm_omni.diffusion.step_policy import DenoiseExecutionPolicy
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -1507,6 +1508,13 @@ class QwenImage21Transformer2DModel(CachedTransformer):
 
             self._request_geometry_owner = (weakref.ref(kv_cache, release_expired_request),)
         return previous[1]
+
+    def get_execution_policy(self, step_idx: int) -> DenoiseExecutionPolicy:
+        """Resolve choices on the actual consumers used by this transformer."""
+        policy = DenoiseExecutionPolicy().with_consumer(self.quant_config, step_idx)
+        for block in self.transformer_blocks:
+            policy = policy.with_consumer(block.attn.attn, step_idx)
+        return policy
 
     def release_request_geometry(self) -> None:
         """Release request-owned metadata and prefix KV references after denoising."""

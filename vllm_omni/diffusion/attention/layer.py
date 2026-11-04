@@ -7,7 +7,7 @@
 # https://github.com/feifeibear/long-context-attention/blob/main/yunchang/attention/layer.py
 
 
-from collections.abc import Mapping
+from collections.abc import Hashable, Mapping
 from dataclasses import replace
 from typing import cast
 
@@ -34,7 +34,7 @@ from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
-from vllm_omni.diffusion.data import is_quantized_attention_dtype
+from vllm_omni.diffusion.data import is_quantized_attention_dtype, resolve_attention_dtype_override
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.layout import assert_backend_layout_supported
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
@@ -43,6 +43,7 @@ from vllm_omni.diffusion.forward_context import (
     get_ulysses_mode,
     is_forward_context_available,
 )
+from vllm_omni.diffusion.step_policy import resolve_step_execution_key
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -411,25 +412,26 @@ class Attention(nn.Module):
         if self._kv_cache_skip_layers and self.layer_idx is None and not self._disable_kv_quant:
             raise ValueError("Attention quantization skip_layers requires a parseable transformer block index.")
 
-    def _should_apply_kv_cache_quant(self) -> bool:
-        skip_steps = self._kv_cache_skip_steps
-        skip_layers = self._kv_cache_skip_layers
-        if skip_steps is not None:
-            step_idx = get_forward_context().denoise_step_idx if is_forward_context_available() else None
-            if skip_steps and (step_idx is None or step_idx in skip_steps):
-                return False
-        if skip_layers is not None:
-            if self.layer_idx is not None and self.layer_idx in skip_layers:
-                return False
-        return True
+    def _resolve_kv_cache_dtype(self, step_idx: int | None) -> str | None:
+        dtype = resolve_attention_dtype_override(self._kv_cache_dtype, step_idx, self._kv_cache_skip_steps)
+        skipped_layer = self._kv_cache_skip_layers is not None and self.layer_idx in self._kv_cache_skip_layers
+        if dtype is not None and (self._disable_kv_quant or skipped_layer):
+            return "float"
+        return dtype
+
+    def get_step_execution_key(self, step_idx: int) -> tuple[str | None, Hashable]:
+        """Include both this layer's precision policy and its actual backend's policy."""
+        return self._resolve_kv_cache_dtype(step_idx), resolve_step_execution_key(self.attention, step_idx)
 
     def _with_kv_cache_dtype(self, attn_metadata: AttentionMetadata | None) -> AttentionMetadata | None:
-        disabled = self._disable_kv_quant or not self._should_apply_kv_cache_quant()
-        dtype = self._kv_cache_dtype
-        if not is_quantized_attention_dtype(dtype):
-            dtype = None
-        elif disabled:
-            dtype = "float"
+        context = get_forward_context() if is_forward_context_available() else None
+        step_idx = context.denoise_step_idx if context is not None else None
+        policy = getattr(context, "denoise_execution_policy", None)
+        dtype = (
+            cast(tuple[str | None, Hashable], policy.choice_for(self))[0]
+            if policy is not None
+            else self._resolve_kv_cache_dtype(step_idx)
+        )
         if dtype is None and (attn_metadata is None or "kv_cache_dtype" not in attn_metadata.extra):
             return attn_metadata
         extra = dict(attn_metadata.extra) if attn_metadata is not None else {}

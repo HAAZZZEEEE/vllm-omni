@@ -242,6 +242,10 @@ class FlashAttentionBackend(AttentionBackend):
 
 
 class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
+    def get_step_execution_key(self, step_idx: int) -> None:
+        # Step-dependent precision is fully represented by Attention metadata.
+        return None
+
     # Per-platform attention quantization support.
     # To enable a method on a new platform, add its OmniPlatformEnum value here
     # and handle kv_cache_dtype in the corresponding forward_{platform}().

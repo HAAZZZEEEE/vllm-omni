@@ -15,6 +15,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.step_policy import DenoiseExecutionPolicy
 
 if TYPE_CHECKING:
     import torch
@@ -49,6 +50,7 @@ class ForwardContext:
     in_diffusion_kv_memory_profile: bool = False
     split_text_embed_in_sp: bool = False
     denoise_step_idx: int | None = None
+    denoise_execution_policy: DenoiseExecutionPolicy | None = None
     denoise_timestep: float | None = None
     total_denoise_steps: int | None = None
     # Per-request reference latent for img2img DiT models (e.g. Ming)

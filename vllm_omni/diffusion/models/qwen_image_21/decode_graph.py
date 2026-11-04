@@ -217,6 +217,8 @@ class QwenImage21DecodeGraphManager:
         """One-time checks that cannot change after weights are loaded."""
         model = self.model
         reason = self._offload_reason()
+        if reason is None and getattr(getattr(model, "quant_config", None), "w4a8_fallback_steps", None):
+            reason = "Linear step fallback changes the captured execution path"
         param = next(model.parameters(), None)
         if reason is None and (param is None or param.device.type != "cuda"):
             reason = f"model is not on CUDA (device={None if param is None else param.device})"

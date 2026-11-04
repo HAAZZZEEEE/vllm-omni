@@ -168,7 +168,8 @@ def test_cache_manager_initializes_with_quantization_skip_layers(monkeypatch):
                 prefix="model.layers.3.self_attn",
             )
     assert mgr.attn.layer_idx == 3
-    assert not mgr.attn._should_apply_kv_cache_quant()
+    assert mgr.attn._kv_cache_skip_layers == {3}
+    assert mgr.attn._with_kv_cache_dtype(None) is None
 
 
 @pytest.mark.parametrize("first_step", [True, False])

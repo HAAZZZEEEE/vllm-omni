@@ -206,6 +206,10 @@ class SDPABackend(AttentionBackend):
 
 
 class SDPAImpl(AttentionImpl):
+    def get_step_execution_key(self, step_idx: int) -> None:
+        # Dense SDPA does not consume the scalar denoise-step index.
+        return None
+
     def __init__(
         self,
         num_heads: int,

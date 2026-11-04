@@ -113,7 +113,16 @@ def _validate_w4a8_fallback_layers(layers: list[str] | None) -> list[str]:
     return sorted(set(layers))
 
 
-def _is_w4a8_fallback_step(steps: list[int]) -> bool:
+def _resolve_w4a8_fallback_step(steps: list[int], step_idx: int | None) -> bool:
+    """Shared pure decision for batching and Linear execution."""
+    if not steps:
+        return False
+    if step_idx is None:
+        raise RuntimeError("W4A8 step fallback requires a pipeline that publishes its denoise step in ForwardContext.")
+    return step_idx in steps
+
+
+def _is_w4a8_fallback_step(steps: list[int], *, policy_owner: object | None = None) -> bool:
     """Read the request's zero-based denoise index; never keep state on a Linear."""
     if not steps:
         return False
@@ -123,10 +132,11 @@ def _is_w4a8_fallback_step(steps: list[int]) -> bool:
         is_forward_context_available,
     )
 
-    step = get_forward_context().denoise_step_idx if is_forward_context_available() else None
-    if step is None:
-        raise RuntimeError("W4A8 step fallback requires a pipeline that publishes its denoise step in ForwardContext.")
-    return step in steps
+    context = get_forward_context() if is_forward_context_available() else None
+    policy = getattr(context, "denoise_execution_policy", None)
+    if policy is not None and policy_owner is not None:
+        return cast(bool, policy.choice_for(policy_owner))
+    return _resolve_w4a8_fallback_step(steps, context.denoise_step_idx if context is not None else None)
 
 
 def _validate_smooth_scale(scale: torch.Tensor) -> None:
@@ -174,6 +184,10 @@ class DiffusionMXFP4Config(QuantizationConfig):
         if type(mxfp4_scale_alg) is not int or mxfp4_scale_alg not in (0, 2):
             raise ValueError("mxfp4_scale_alg must be 0 (OCP MX) or 2 (UOS with dst_type_max=7.25).")
         self.mxfp4_scale_alg = mxfp4_scale_alg
+
+    def get_step_execution_key(self, step_idx: int) -> bool:
+        # Fixed per-layer fallback/ignored masks do not vary across requests.
+        return _resolve_w4a8_fallback_step(self.w4a8_fallback_steps, step_idx)
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -450,7 +464,9 @@ class NPUMxfp4LinearMethod(MXFPLinearMethodBase):
         # weights the same pre-scale must precede both A4 and A8 quantization.
         if (mul_scale := getattr(layer, "mul_scale", None)) is not None:
             x = x * mul_scale.to(x.dtype)
-        if self.is_w4a8_fallback_layer or _is_w4a8_fallback_step(self.quant_config.w4a8_fallback_steps):
+        if self.is_w4a8_fallback_layer or _is_w4a8_fallback_step(
+            self.quant_config.w4a8_fallback_steps, policy_owner=self.quant_config
+        ):
             return _npu_w4a8_matmul(
                 x, cast(torch.Tensor, layer.weight), cast(torch.Tensor, layer.weight_scale), bias, ori_dtype
             )

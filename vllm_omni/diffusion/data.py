@@ -7,7 +7,7 @@ import math
 import os
 import random
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Set
 from dataclasses import dataclass, field, fields
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -196,6 +196,22 @@ def is_quantized_attention_dtype(dtype: str | None) -> bool:
     This classifies the knob, not backend support or explicit backend quant specs.
     """
     return dtype not in (None, "auto", "float")
+
+
+def resolve_attention_dtype_override(
+    dtype: str | None, step_idx: int | None, skip_steps: Set[int] | None
+) -> str | None:
+    """Resolve the unified step override, not backend support or layer opt-outs.
+
+    None leaves backend policy untouched; "float" disables configured unified
+    quantization for this step. Unknown steps conservatively honor nonempty
+    selectors. Quantized dtype names pass through to the backend unchanged.
+    """
+    if not is_quantized_attention_dtype(dtype):
+        return None
+    if skip_steps and (step_idx is None or step_idx in skip_steps):
+        return "float"
+    return dtype
 
 
 def parse_kv_cache_skip_selector(

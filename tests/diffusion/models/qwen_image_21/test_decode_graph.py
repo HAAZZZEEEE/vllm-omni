@@ -129,7 +129,7 @@ def test_model_level_offload_without_staging_disables_decode_graphs():
 @pytest.mark.cpu
 def test_top_level_offload_hook_without_staging_disables_decode_graphs():
     model = DecodeModel()
-    manager = decode_graph.QwenImage21DecodeGraphManager(model)
+    manager = decode_graph.QwenImage21DecodeGraphManager(model, max_entries=2)
     registry = HookRegistry.get_or_create(model)
     # A present-but-empty registry (e.g. after hooks were removed) must not disqualify.
     assert manager._offload_reason() is None
@@ -399,3 +399,20 @@ def test_evicting_a_graph_keeps_survivor_workspace_when_warmup_aliases_capture(g
     # Survivor terms: key 2, value 3, RoPE frequencies equal to the layout rows.
     expected = torch.ones_like(result).sin() + 2.0 + 3.0 + layouts[1][1] + gemm_mean
     torch.testing.assert_close(result, expected, rtol=0, atol=5e-2)
+
+
+@pytest.mark.cpu
+def test_linear_step_fallback_disables_graph_replay(monkeypatch):
+    from vllm_omni.quantization.mxfp4_config import DiffusionMXFP4Config
+
+    class CUDAParameter:
+        device = torch.device("cuda")
+
+    model = torch.nn.Module()
+    model.transformer_blocks = []
+    monkeypatch.setattr(model, "parameters", lambda: iter([CUDAParameter()]))
+    monkeypatch.setattr("vllm.distributed.get_tensor_model_parallel_world_size", lambda: 1)
+    manager = decode_graph.QwenImage21DecodeGraphManager(model, max_entries=2)
+    assert manager._check_static_eligibility()
+    model.quant_config = DiffusionMXFP4Config(w4a8_fallback_steps=[2])
+    assert not manager._check_static_eligibility()

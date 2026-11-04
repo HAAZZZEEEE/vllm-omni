@@ -122,22 +122,46 @@ the index fails during lazy paged-KV activation. Restoration only writes the
 saved selector; it does not invoke the setter or activate paged KV. The worker
 retains ownership of that lifecycle. This preserves an outer caller's selector,
 not arbitrary nested pipeline/cache execution.
-When step selectors control an enabled `diffusion_kv_cache_dtype`
-quantization policy, heterogeneous step batches are split so one request cannot
-inherit another request's precision policy. With `None`, `auto`, or `float`,
-retaining a step selector does not introduce step-based splitting. Existing
-prefix-length compatibility grouping still applies.
+Qwen-Image-2.1 groups compatible requests by execution policy rather than exact
+step index. Each step consumer exposes a pure `get_step_execution_key(step_idx)`:
+equal immutable host keys promise equivalent choices at those indices, with all
+other execution conditions fixed. Undeclared consumers require exact steps.
+Qwen is the first batching integration; other pipelines keep their existing
+execution unless they opt into the shared policy contract. The transformer
+composes its actual Attention layers and resolved Linear
+quantization config; the pipeline also includes the active paged runtime's key.
+Dense FlashAttention and SDPA declare no additional step dependency. MXFP4
+Linear includes its W4A4/W4A8 step fallback independently of Attention precision.
+Other backends and quantization configs can declare their own policies without
+adding dtype or backend-name branches to Qwen batching.
 
-Linear W4A8 step fallback independently requires same-step groups, including
-when Attention uses native precision. The scalar context always describes a
-real common step; it is never a representative for different steps. Different
-steps with identical precision remain separate when a step selector is active.
-Merging those groups requires an explicit shared execution-policy context.
- Explicit backend quant
-specs are not controlled by this step selector.
-The shared `is_quantized_attention_dtype` predicate classifies the unified
-precision knob for configuration validation, `Attention`, and pipeline batching;
-backend capability checks remain separate.
+`resolve_attention_dtype_override` is shared by Attention's execution and key
+query. It returns no override for `None`, `auto`, or `float`, native precision for
+a skipped quantized step, and the configured quantized dtype otherwise. Layer
+opt-outs remain local to Attention, and backend capability checks remain separate.
+The MXFP4 config similarly shares its pure fallback resolver with Linear execution.
+Neither query reads or writes `ForwardContext` or activates paged KV.
+
+Each compatible group installs an immutable `DenoiseExecutionPolicy` on the
+shared `ForwardContext`. Attention and Linear consume the resolved choices
+from that policy, using the same resolvers as legacy step-based execution.
+Consumer identities are local to the live model; policies are not persisted or
+sent across workers. A missing consumer in an active policy is an error.
+An explicit native choice is distinct from an absent policy. Without a policy,
+existing model callers retain their scalar-step behavior.
+
+`denoise_step_idx` remains a real common index. Mixed-step groups publish
+`None`, never a representative step. Request indices and per-row scheduler
+timesteps are unchanged. Both fields are restored on success or failure;
+whole-request Qwen execution clears any entering policy within its scope.
+Prefix-length and scheduler compatibility rules still
+apply, and mixed prefill/decode phases remain unsupported. A runtime without a
+compatibility declaration, or an absent ForwardContext, keeps exact-step grouping.
+With `skip_steps="0"`, dense MXFP8 decode steps 1, 2 and 3 can share a forward when
+Linear and runtime policies permit it; Linear fallback at step 2 separates that
+request even if Attention uses the same precision throughout. Retaining a skip
+selector on native Attention alone does not introduce additional splitting.
+Explicit backend quant specs are not controlled by this step selector.
 This does not change backend selection or relax unsupported mask checks.
 
 The explicit Triton provider accepts H3 tile64/128 on SM80+ in BF16.
@@ -183,3 +207,7 @@ MiniMax-H3 supplies `MiniMaxH3VSAImpl` through `impl_overrides`.
 `models/minimax_h3/attention/fastvideo_h3.py` owns its prefix layout, video tiling, and
 learned compression gate. Pooling, block-map construction, and tile64 provider
 calls are shared through `attention/ops/block_sparse.py`.
+
+Qwen decode graphs retain their existing quantized-attention exclusions and
+also stay eager with Linear step fallback: the existing graph key does not
+represent changing Linear execution choices.
